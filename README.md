@@ -102,7 +102,7 @@ The Gradle wrapper is included and downloads Gradle 8.9 automatically.
 
 ```bash
 git clone https://github.com/HenryDelMal/Android-encodec-player.git
-cd YOUR-REPOSITORY
+cd Android-encodec-player
 ```
 
 Replace the example URL with the repository address created in your GitHub
