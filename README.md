@@ -101,7 +101,7 @@ The Gradle wrapper is included and downloads Gradle 8.9 automatically.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
+git clone https://github.com/HenryDelMal/Android-encodec-player.git
 cd YOUR-REPOSITORY
 ```
 
