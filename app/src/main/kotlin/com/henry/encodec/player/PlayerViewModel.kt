@@ -1,0 +1,558 @@
+package com.henry.encodec.player
+
+import android.app.Application
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.net.Uri
+import android.os.Build
+import android.provider.OpenableColumns
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.henry.encodec.decoder.ExecuTorchEncodecDecoder
+import com.henry.encodec.ecdc.EcdcHeader
+import com.henry.encodec.ecdc.EcdcReader
+import com.henry.encodec.ecdc.EncodecVariant
+import com.henry.encodec.playback.EcdcPlaybackSession
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import java.io.File
+import java.io.InputStream
+import java.lang.ref.WeakReference
+
+data class PlaylistItem(
+    val uri: Uri,
+    val title: String,
+    val header: EcdcHeader,
+)
+
+data class PlayerState(
+    val playlist: List<PlaylistItem> = emptyList(),
+    val currentIndex: Int = -1,
+    val playing: Boolean = false,
+    val paused: Boolean = false,
+    val progress: Float = 0f,
+    val addingUrl: Boolean = false,
+    val error: String? = null,
+) {
+    val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
+}
+
+class PlayerViewModel(application: Application) : AndroidViewModel(application) {
+    private val mutableState = MutableStateFlow(PlayerState())
+    val state = mutableState.asStateFlow()
+    private var playbackJob: Job? = null
+    @Volatile private var session: EcdcPlaybackSession? = null
+    private var playbackGeneration = 0L
+    private var requestedStartSample = 0L
+    private val decoderMutex = Mutex()
+    private val mediaSession = MediaSession(application, "EnCodec Player").apply {
+        setCallback(object : MediaSession.Callback() {
+            override fun onPlay() = play()
+            override fun onPause() = pause()
+            override fun onStop() = stop()
+            override fun onSkipToNext() = next()
+            override fun onSkipToPrevious() = previous()
+            override fun onSeekTo(pos: Long) = seekToMillis(pos)
+        })
+        isActive = true
+    }
+
+    init {
+        removeObsoleteDecoderModels()
+        activeInstance = WeakReference(this)
+        viewModelScope.launch {
+            state.collect(::publishMediaState)
+        }
+    }
+
+    fun addToPlaylist(uris: List<Uri>) {
+        val resolver = getApplication<Application>().contentResolver
+        val existing = mutableState.value.playlist.map { it.uri }.toSet()
+        val accepted = mutableListOf<PlaylistItem>()
+        val errors = mutableListOf<String>()
+
+        uris.filterNot(existing::contains).forEach { uri ->
+            runCatching {
+                val header = resolver.openInputStream(uri)!!.use(EcdcReader::inspect)
+                validateHeader(header)
+                PlaylistItem(uri, displayName(uri), header)
+            }.onSuccess(accepted::add).onFailure {
+                errors += "${displayName(uri)}: ${it.message}"
+            }
+        }
+
+        val old = mutableState.value
+        val combined = old.playlist + accepted
+        val selectingFirstTrack = old.currentIndex < 0 && combined.isNotEmpty()
+        if (selectingFirstTrack) requestedStartSample = 0
+        mutableState.value = old.copy(
+            playlist = combined,
+            currentIndex = if (selectingFirstTrack) 0 else old.currentIndex,
+            progress = if (selectingFirstTrack) 0f else old.progress,
+            error = errors.takeIf { it.isNotEmpty() }?.joinToString("\n"),
+        )
+    }
+
+    fun addUrl(rawUrl: String) {
+        if (mutableState.value.addingUrl) return
+        val text = rawUrl.trim()
+        val uri = runCatching { Uri.parse(text) }.getOrNull()
+        if (
+            uri == null ||
+            !uri.scheme.equals("https", ignoreCase = true) ||
+            uri.host.isNullOrBlank()
+        ) {
+            mutableState.value = mutableState.value.copy(error = "Enter a valid HTTPS URL")
+            return
+        }
+        if (mutableState.value.playlist.any { it.uri == uri }) {
+            mutableState.value = mutableState.value.copy(error = "That URL is already in the playlist")
+            return
+        }
+
+        mutableState.value = mutableState.value.copy(addingUrl = true, error = null)
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    openInput(uri).use { input ->
+                        val header = EcdcReader.inspect(input)
+                        validateHeader(header)
+                        PlaylistItem(uri, remoteDisplayName(uri), header)
+                    }
+                }
+            }
+            val old = mutableState.value
+            result.onSuccess { item ->
+                if (old.playlist.any { it.uri == item.uri }) {
+                    mutableState.value = old.copy(addingUrl = false)
+                } else {
+                    val combined = old.playlist + item
+                    val selectingFirstTrack = old.currentIndex < 0
+                    if (selectingFirstTrack) requestedStartSample = 0
+                    mutableState.value = old.copy(
+                        playlist = combined,
+                        currentIndex = if (selectingFirstTrack) 0 else old.currentIndex,
+                        progress = if (selectingFirstTrack) 0f else old.progress,
+                        addingUrl = false,
+                        error = null,
+                    )
+                }
+            }.onFailure { error ->
+                mutableState.value = old.copy(
+                    addingUrl = false,
+                    error = "Could not add URL: ${error.message ?: "network error"}",
+                )
+            }
+        }
+    }
+
+    fun selectTrack(index: Int) {
+        if (index !in mutableState.value.playlist.indices) return
+        val wasActive = mutableState.value.playing
+        requestedStartSample = 0
+        stopInternal(resetProgress = true)
+        mutableState.value = mutableState.value.copy(currentIndex = index)
+        if (wasActive) startPlayback()
+    }
+
+    fun playPause() {
+        val snapshot = mutableState.value
+        when {
+            !snapshot.playing -> startPlayback()
+            snapshot.paused -> play()
+            else -> pause()
+        }
+    }
+
+    fun play() {
+        val snapshot = mutableState.value
+        when {
+            !snapshot.playing -> startPlayback()
+            snapshot.paused -> {
+                session?.resume()
+                mutableState.value = snapshot.copy(paused = false)
+            }
+        }
+    }
+
+    fun pause() {
+        val snapshot = mutableState.value
+        if (snapshot.playing && !snapshot.paused) {
+            session?.pause()
+            mutableState.value = snapshot.copy(paused = true)
+        }
+    }
+
+    fun stop() {
+        requestedStartSample = 0
+        stopInternal(resetProgress = true)
+    }
+
+    fun next() {
+        val snapshot = mutableState.value
+        if (snapshot.playlist.isEmpty()) return
+        requestedStartSample = 0
+        moveAndPlay((snapshot.currentIndex + 1).coerceAtMost(snapshot.playlist.lastIndex))
+    }
+
+    fun previous() {
+        val snapshot = mutableState.value
+        if (snapshot.playlist.isEmpty()) return
+        val positionSeconds = snapshot.current?.let {
+            it.header.audioLengthSamples * snapshot.progress / it.header.variant.sampleRate
+        } ?: 0f
+        if (positionSeconds >= 3f) {
+            seekToFraction(0f)
+            return
+        }
+        requestedStartSample = 0
+        moveAndPlay((snapshot.currentIndex - 1).coerceAtLeast(0))
+    }
+
+    fun seekToFraction(fraction: Float) {
+        val snapshot = mutableState.value
+        val current = snapshot.current ?: return
+        val safeFraction = fraction.coerceIn(0f, 0.999999f)
+        requestedStartSample = (current.header.audioLengthSamples * safeFraction).toLong()
+        mutableState.value = snapshot.copy(progress = safeFraction)
+        if (snapshot.playing) startPlayback(startPaused = snapshot.paused)
+    }
+
+    fun seekToMillis(positionMillis: Long) {
+        val current = mutableState.value.current ?: return
+        val durationMillis = current.header.audioLengthSamples * 1_000L /
+            current.header.variant.sampleRate
+        if (durationMillis > 0) {
+            seekToFraction(positionMillis.toFloat() / durationMillis)
+        }
+    }
+
+    fun clearPlaylist() {
+        requestedStartSample = 0
+        stopInternal(resetProgress = true)
+        mutableState.value = PlayerState()
+    }
+
+    private fun moveAndPlay(index: Int) {
+        stopInternal(resetProgress = true)
+        mutableState.value = mutableState.value.copy(currentIndex = index)
+        startPlayback()
+    }
+
+    private fun startPlayback(startPaused: Boolean = false) {
+        val selected = mutableState.value.current ?: return
+        if (requestedStartSample >= selected.header.audioLengthSamples - 1) {
+            requestedStartSample = 0
+        }
+        stopInternal(resetProgress = false)
+        val generation = playbackGeneration
+        val initialStartSample = requestedStartSample
+        playbackJob = viewModelScope.launch {
+            val initial = mutableState.value
+            val initialDuration = initial.current?.header?.audioLengthSamples ?: 1L
+            mutableState.value = mutableState.value.copy(
+                playing = true,
+                paused = startPaused,
+                progress = (initialStartSample.toDouble() / initialDuration)
+                    .toFloat().coerceIn(0f, 1f),
+                error = null,
+            )
+            try {
+                decoderMutex.withLock {
+                    while (isActive) {
+                        val snapshot = mutableState.value
+                        val item = snapshot.current ?: break
+                        val playingIndex = snapshot.currentIndex
+                        val trackStartSample = if (playingIndex == initial.currentIndex) {
+                            initialStartSample
+                        } else {
+                            0L
+                        }
+                        val config = decoderConfig(item.header.variant)
+                        ExecuTorchEncodecDecoder(
+                            copyAssetOnce(config.assetName),
+                            item.header.variant,
+                            maxCodebooks = config.maxCodebooks,
+                            modelTimeSteps = config.timeSteps,
+                        ).use { decoder ->
+                            val newSession = EcdcPlaybackSession(decoder)
+                            session = newSession
+                            if (mutableState.value.paused) newSession.pause()
+                            withContext(Dispatchers.IO) {
+                                openInput(item.uri).use { input ->
+                                    newSession.play(
+                                        input = input,
+                                        startSample = trackStartSample,
+                                        onProgress = { progress ->
+                                            if (playbackGeneration == generation) {
+                                                requestedStartSample =
+                                                    (item.header.audioLengthSamples * progress).toLong()
+                                                mutableState.value = mutableState.value.copy(progress = progress)
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        if (playbackGeneration != generation) break
+                        if (playingIndex >= mutableState.value.playlist.lastIndex) break
+                        requestedStartSample = 0
+                        mutableState.value = mutableState.value.copy(
+                            currentIndex = playingIndex + 1,
+                            progress = 0f,
+                        )
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (playbackGeneration == generation) {
+                    mutableState.value = mutableState.value.copy(
+                        error = error.message ?: "Playback failed",
+                    )
+                }
+            } finally {
+                if (playbackGeneration == generation) {
+                    session = null
+                    mutableState.value = mutableState.value.copy(
+                        playing = false,
+                        paused = false,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun stopInternal(resetProgress: Boolean) {
+        playbackGeneration++
+        session?.stop()
+        playbackJob?.cancel()
+        playbackJob = null
+        session = null
+        val snapshot = mutableState.value
+        mutableState.value = snapshot.copy(
+            playing = false,
+            paused = false,
+            progress = if (resetProgress) 0f else snapshot.progress,
+        )
+    }
+
+    private fun publishMediaState(state: PlayerState) {
+        val current = state.current
+        val durationMillis = current?.let {
+            it.header.audioLengthSamples * 1_000L / it.header.variant.sampleRate
+        } ?: 0L
+        val positionMillis = (durationMillis * state.progress).toLong()
+        val playbackState = when {
+            state.playing && !state.paused -> PlaybackState.STATE_PLAYING
+            state.playing -> PlaybackState.STATE_PAUSED
+            else -> PlaybackState.STATE_STOPPED
+        }
+        mediaSession.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_STOP or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or
+                        PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+                        PlaybackState.ACTION_SEEK_TO,
+                )
+                .setState(playbackState, positionMillis, if (playbackState == PlaybackState.STATE_PLAYING) 1f else 0f)
+                .build(),
+        )
+        mediaSession.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, current?.title ?: "EnCodec Player")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "EnCodec audio")
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, durationMillis)
+                .build(),
+        )
+        mediaSession.isActive = current != null
+        publishMediaNotification(state)
+    }
+
+    private fun publishMediaNotification(state: PlayerState) {
+        val manager = getApplication<Application>()
+            .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val current = state.current
+        if (!state.playing || current == null) {
+            manager.cancel(MEDIA_NOTIFICATION_ID)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    MEDIA_CHANNEL_ID,
+                    "Playback",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply { description = "EnCodec playback controls" },
+            )
+        }
+        val playPauseTitle = if (state.paused) "Play" else "Pause"
+        val playPauseIcon = if (state.paused) {
+            android.R.drawable.ic_media_play
+        } else {
+            android.R.drawable.ic_media_pause
+        }
+        val notification = Notification.Builder(getApplication(), MEDIA_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(current.title)
+            .setContentText("EnCodec audio")
+            .setContentIntent(mediaIntent(MainActivity.ACTION_OPEN, 0))
+            .setOnlyAlertOnce(true)
+            .setOngoing(!state.paused)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .addAction(
+                android.R.drawable.ic_media_previous,
+                "Previous",
+                mediaIntent(MainActivity.ACTION_PREVIOUS, 1),
+            )
+            .addAction(
+                playPauseIcon,
+                playPauseTitle,
+                mediaIntent(MainActivity.ACTION_PLAY_PAUSE, 2),
+            )
+            .addAction(
+                android.R.drawable.ic_media_next,
+                "Next",
+                mediaIntent(MainActivity.ACTION_NEXT, 3),
+            )
+            .setStyle(
+                Notification.MediaStyle()
+                    .setMediaSession(mediaSession.sessionToken)
+                    .setShowActionsInCompactView(0, 1, 2),
+            )
+            .build()
+        manager.notify(MEDIA_NOTIFICATION_ID, notification)
+    }
+
+    private fun mediaIntent(action: String, requestCode: Int): PendingIntent {
+        if (action == MainActivity.ACTION_OPEN) {
+            val openIntent = Intent(getApplication(), MainActivity::class.java).apply {
+                this.action = action
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            return PendingIntent.getActivity(
+                getApplication(),
+                requestCode,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        }
+        val commandIntent = Intent(getApplication(), MediaControlReceiver::class.java).apply {
+            this.action = action
+        }
+        return PendingIntent.getBroadcast(
+            getApplication(),
+            requestCode,
+            commandIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    override fun onCleared() {
+        stopInternal(resetProgress = false)
+        val manager = getApplication<Application>()
+            .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(MEDIA_NOTIFICATION_ID)
+        if (activeInstance?.get() === this) activeInstance = null
+        mediaSession.release()
+        super.onCleared()
+    }
+
+    companion object {
+        private var activeInstance: WeakReference<PlayerViewModel>? = null
+        const val MEDIA_CHANNEL_ID = "encodec_playback"
+        const val MEDIA_NOTIFICATION_ID = 48
+
+        internal fun dispatchMediaAction(action: String?) {
+            val player = activeInstance?.get() ?: return
+            when (action) {
+                MainActivity.ACTION_PLAY_PAUSE -> player.playPause()
+                MainActivity.ACTION_PREVIOUS -> player.previous()
+                MainActivity.ACTION_NEXT -> player.next()
+            }
+        }
+    }
+
+    private fun displayName(uri: Uri): String {
+        val resolver = getApplication<Application>().contentResolver
+        return resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "EnCodec track"
+    }
+
+    private fun remoteDisplayName(uri: Uri): String {
+        val pathName = uri.lastPathSegment
+            ?.substringAfterLast('/')
+            ?.takeIf { it.isNotBlank() }
+        return Uri.decode(pathName ?: uri.host ?: "HTTPS stream")
+    }
+
+    private fun openInput(uri: Uri): InputStream =
+        if (uri.scheme.equals("https", ignoreCase = true)) {
+            HttpsStreams.open(uri.toString())
+        } else {
+            getApplication<Application>().contentResolver.openInputStream(uri)
+                ?: throw IllegalStateException("Could not open the selected file")
+        }
+
+    private fun validateHeader(header: EcdcHeader) {
+        require(!header.usesLanguageModel) {
+            "LM-coded files are not supported yet"
+        }
+        require(header.variant == EncodecVariant.STEREO_48_KHZ) {
+            "24 kHz non-HQ files are not supported"
+        }
+    }
+
+    private fun decoderConfig(variant: EncodecVariant): DecoderConfig = when (variant) {
+        EncodecVariant.STEREO_48_KHZ -> DecoderConfig(
+            assetName = "encodec_48khz_decoder.pte",
+            maxCodebooks = 16,
+            timeSteps = 150,
+        )
+        EncodecVariant.MONO_24_KHZ -> error("24 kHz non-HQ files are not supported")
+    }
+
+    private data class DecoderConfig(
+        val assetName: String,
+        val maxCodebooks: Int,
+        val timeSteps: Int,
+    )
+
+    private fun copyAssetOnce(name: String): File {
+        val filesDir = getApplication<Application>().filesDir
+        val destination = File(filesDir, name)
+        if (!destination.exists()) {
+            getApplication<Application>().assets.open(name).use { source ->
+                destination.outputStream().use(source::copyTo)
+            }
+        }
+        return destination
+    }
+
+    private fun removeObsoleteDecoderModels() {
+        val filesDir = getApplication<Application>().filesDir
+        File(filesDir, "encodec_24khz_decoder.pte").delete()
+        File(filesDir, "encodec_24khz_decoder_308.pte").delete()
+    }
+}

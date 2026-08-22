@@ -1,0 +1,4 @@
+encodec==0.1.1
+executorch==1.0.0
+torch==2.9.0
+torchaudio==2.9.0
