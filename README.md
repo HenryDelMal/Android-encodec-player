@@ -38,6 +38,9 @@ removed.
 - Local `.ecdc` file picker.
 - Playlist with play, pause, stop, previous, next, and seeking.
 - Android media-session and notification controls.
+- Adaptive `AudioTrack` creation with a 16-bit PCM fallback for Android
+  emulators and restrictive audio devices.
+- Legacy minimum-buffer PCM16 output on Android 8.0/8.1 and API 27 AVDs.
 - Per-file duration, codebook count, sample rate, and nominal bitrate.
 - Progressive playback from a direct HTTPS URL without downloading the entire
   file first.
@@ -104,9 +107,6 @@ The Gradle wrapper is included and downloads Gradle 8.9 automatically.
 git clone https://github.com/HenryDelMal/Android-encodec-player.git
 cd Android-encodec-player
 ```
-
-Replace the example URL with the repository address created in your GitHub
-account.
 
 ### 2. Generate the HQ decoder model
 
@@ -194,6 +194,8 @@ supported by this app.
 - HQ EnCodec only; no 24 kHz non-HQ decoder.
 - No language-model entropy-coded streams.
 - CPU/XNNPACK inference only; no guaranteed GPU or NPU acceleration.
+- Emulator decoding speed depends heavily on the host CPU and virtualization
+  settings, even when its audio output is compatible.
 - No gapless-playback guarantee.
 - Remote streams have no persistent cache or HTTP Range index.
 - Global cleartext traffic is enabled to permit accepted HTTPS-to-HTTP
