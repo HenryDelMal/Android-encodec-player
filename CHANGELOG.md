@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.8.4
+
+- Added exact HQ ECDC frame-offset calculation for static URL seeking.
+- Static playback and seeking now use HTTP byte ranges instead of downloading
+  the complete file or scanning from byte zero.
+- Reduced EDGE startup to a bitrate-aware buffer of roughly three to six
+  seconds while retaining up to 512 KiB of bounded download-ahead data.
+- Made seek cancellation close the previous HTTP range immediately instead of
+  waiting for its read timeout, and reused the validated ECDC header in memory.
+- Started the new HTTP range concurrently with ExecuTorch decoder initialization
+  so connection and initial buffering no longer wait for model setup.
+- Started live manifest polling and segment prefetching before decoder
+  initialization, allowing the two-segment live buffer to fill concurrently.
+
+## 0.8.3
+
+- Added bounded background download-ahead buffering for static HTTPS ECDC
+  files, with a bitrate-aware startup cushion and up to 512 KiB held in memory.
+- Kept fetching compressed audio while the decoder is running so temporary
+  network stalls are less likely to starve `AudioTrack`.
+- Preserved progressive playback: the complete remote file does not need to be
+  downloaded before playback starts.
+- Reduced startup latency for low-bitrate files and inspect new URLs with a
+  1 KiB HTTP Range request before playback.
+
 ## 0.8.2
 
 - Added a background queue of up to three downloaded, integrity-verified live

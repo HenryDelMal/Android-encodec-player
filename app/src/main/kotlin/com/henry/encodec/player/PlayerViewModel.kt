@@ -23,7 +23,10 @@ import com.henry.encodec.playback.EcdcPlaybackSession
 import com.henry.encodec.playback.LiveEcdcPlaybackSession
 import com.henry.encodec.playback.LiveEcdcSegment
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
@@ -39,8 +42,10 @@ import kotlinx.coroutines.Dispatchers
 import java.io.File
 import java.io.InputStream
 import java.io.ByteArrayInputStream
+import java.io.SequenceInputStream
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
 
 data class PlaylistItem(
     val uri: Uri,
@@ -92,6 +97,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private var requestedStartSample = 0L
     private val shufflePlayedUris = mutableSetOf<String>()
     private val decoderMutex = Mutex()
+    private val remoteHeaderPrefixes = ConcurrentHashMap<String, ByteArray>()
     private val mediaSession = MediaSession(application, "EnCodec Player").apply {
         setCallback(object : MediaSession.Callback() {
             override fun onPlay() = play()
@@ -176,7 +182,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    openInput(uri).use { input ->
+                    val prefix = HttpsStreams.readPrefix(
+                        uri.toString(), STATIC_HEADER_PREFIX_BYTES,
+                    ).also { remoteHeaderPrefixes[uri.toString()] = it }
+                    ByteArrayInputStream(prefix).use { input ->
                         val header = EcdcReader.inspect(input)
                         validateHeader(header)
                         PlaylistItem(uri, remoteDisplayName(uri), header)
@@ -453,14 +462,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             )
             try {
                 decoderMutex.withLock {
-                    val config = decoderConfig(EncodecVariant.STEREO_48_KHZ)
-                    ExecuTorchEncodecDecoder(
-                        copyAssetOnce(config.assetName),
-                        EncodecVariant.STEREO_48_KHZ,
-                        maxCodebooks = config.maxCodebooks,
-                        modelTimeSteps = config.timeSteps,
-                    ).use { decoder ->
-                        coroutineScope {
+                    coroutineScope {
                             val source = LiveStreamSource(live.manifestUrl)
                             val queue = Channel<DownloadedLiveSegment>(LIVE_PREFETCH_CAPACITY)
                             val buffered = AtomicInteger(0)
@@ -495,49 +497,56 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             }
                             try {
                                 publishBuffer("Buffering live audio…")
-                                while (buffered.get() < LIVE_STARTUP_SEGMENTS) {
-                                    // Let the producer fill the channel without
-                                    // consuming the first verified segments.
-                                    kotlinx.coroutines.delay(25)
-                                    if (producer.isCompleted) break
-                                }
-                                val newSession = LiveEcdcPlaybackSession(decoder)
-                                liveSession = newSession
-                                newSession.play(
-                                    nextSegment = {
-                                        if (buffered.get() == 0) publishBuffer("Rebuffering…")
-                                        val downloaded = queue.receive()
-                                        buffered.decrementAndGet()
-                                        publishBuffer("Decoding segment ${downloaded.sequence}…")
-                                        mutableState.value = mutableState.value.copy(
-                                            live = mutableState.value.live?.copy(
-                                                codebooks = downloaded.codebooks,
-                                                bandwidthKbps = downloaded.bandwidthKbps,
-                                            ),
-                                        )
-                                        LiveEcdcSegment(
-                                            ByteArrayInputStream(downloaded.bytes),
-                                            downloaded.sequence,
-                                            downloaded.discontinuity,
-                                        )
-                                    },
-                                    onSegmentPlaying = { sequence ->
-                                        if (playbackGeneration == generation) {
+                                val config = decoderConfig(EncodecVariant.STEREO_48_KHZ)
+                                ExecuTorchEncodecDecoder(
+                                    copyAssetOnce(config.assetName),
+                                    EncodecVariant.STEREO_48_KHZ,
+                                    maxCodebooks = config.maxCodebooks,
+                                    modelTimeSteps = config.timeSteps,
+                                ).use { decoder ->
+                                    while (buffered.get() < LIVE_STARTUP_SEGMENTS) {
+                                        // The producer has been filling the queue
+                                        // concurrently with decoder initialization.
+                                        kotlinx.coroutines.delay(25)
+                                        if (producer.isCompleted) break
+                                    }
+                                    val newSession = LiveEcdcPlaybackSession(decoder)
+                                    liveSession = newSession
+                                    newSession.play(
+                                        nextSegment = {
+                                            if (buffered.get() == 0) publishBuffer("Rebuffering…")
+                                            val downloaded = queue.receive()
+                                            buffered.decrementAndGet()
+                                            publishBuffer("Decoding segment ${downloaded.sequence}…")
                                             mutableState.value = mutableState.value.copy(
                                                 live = mutableState.value.live?.copy(
-                                                    status = "LIVE",
-                                                    sequence = sequence,
-                                                    bufferedSegments = buffered.get(),
+                                                    codebooks = downloaded.codebooks,
+                                                    bandwidthKbps = downloaded.bandwidthKbps,
                                                 ),
                                             )
-                                        }
-                                    },
-                                )
+                                            LiveEcdcSegment(
+                                                ByteArrayInputStream(downloaded.bytes),
+                                                downloaded.sequence,
+                                                downloaded.discontinuity,
+                                            )
+                                        },
+                                        onSegmentPlaying = { sequence ->
+                                            if (playbackGeneration == generation) {
+                                                mutableState.value = mutableState.value.copy(
+                                                    live = mutableState.value.live?.copy(
+                                                        status = "LIVE",
+                                                        sequence = sequence,
+                                                        bufferedSegments = buffered.get(),
+                                                    ),
+                                                )
+                                            }
+                                        },
+                                    )
+                                }
                             } finally {
                                 producer.cancelAndJoin()
                                 queue.cancel()
                             }
-                        }
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -573,6 +582,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val generation = playbackGeneration
         val initialStartSample = requestedStartSample
         playbackJob = viewModelScope.launch {
+            val playbackScope = this
             val initial = mutableState.value
             val initialDuration = initial.current?.header?.audioLengthSamples ?: 1L
             mutableState.value = mutableState.value.copy(
@@ -595,6 +605,15 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         }
                         firstIteration = false
                         val config = decoderConfig(item.header.variant)
+                        val preparedRemote = if (item.uri.scheme.equals("https", true)) {
+                            playbackScope.async(Dispatchers.IO) {
+                                prepareRemoteInput(
+                                    playbackScope, item.uri, item.header, trackStartSample,
+                                )
+                            }
+                        } else {
+                            null
+                        }
                         ExecuTorchEncodecDecoder(
                             copyAssetOnce(config.assetName),
                             item.header.variant,
@@ -604,20 +623,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             val newSession = EcdcPlaybackSession(decoder)
                             session = newSession
                             if (mutableState.value.paused) newSession.pause()
-                            withContext(Dispatchers.IO) {
-                                openInput(item.uri).use { input ->
-                                    newSession.play(
-                                        input = input,
-                                        startSample = trackStartSample,
-                                        onProgress = { progress ->
-                                            if (playbackGeneration == generation) {
-                                                requestedStartSample =
-                                                    (item.header.audioLengthSamples * progress).toLong()
-                                                mutableState.value = mutableState.value.copy(progress = progress)
-                                            }
-                                        },
-                                    )
-                                }
+                            withPlaybackInput(item.uri, preparedRemote) {
+                                    input, initialFrameIndex ->
+                                newSession.play(
+                                    input = input,
+                                    startSample = trackStartSample,
+                                    initialFrameIndex = initialFrameIndex,
+                                    onProgress = { progress ->
+                                        if (playbackGeneration == generation) {
+                                            requestedStartSample =
+                                                (item.header.audioLengthSamples * progress).toLong()
+                                            mutableState.value = mutableState.value.copy(progress = progress)
+                                        }
+                                    },
+                                )
                             }
                         }
                         if (playbackGeneration != generation) break
@@ -851,6 +870,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.JUMP_TO_LIVE"
         private const val LIVE_STARTUP_SEGMENTS = 2
         private const val LIVE_PREFETCH_CAPACITY = 3
+        private const val STATIC_HEADER_PREFIX_BYTES = 1024
+        private const val STATIC_STARTUP_SECONDS = 3
+        private const val STATIC_MIN_STARTUP_BYTES = 2 * 1024
+        private const val STATIC_MAX_STARTUP_BYTES = 16 * 1024
 
         internal fun dispatchMediaAction(action: String?) {
             val player = activeInstance?.get() ?: return
@@ -947,6 +970,60 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             getApplication<Application>().contentResolver.openInputStream(uri)
                 ?: throw IllegalStateException("Could not open the selected file")
         }
+
+    private suspend fun <T> withPlaybackInput(
+        uri: Uri,
+        preparedRemote: Deferred<PreparedRemoteInput>?,
+        block: suspend (InputStream, Int) -> T,
+    ): T = withContext(Dispatchers.IO) {
+        if (uri.scheme.equals("https", ignoreCase = true)) {
+            val prepared = requireNotNull(preparedRemote).await()
+            prepared.input.use { block(it, prepared.initialFrameIndex) }
+        } else {
+            openInput(uri).use { block(it, 0) }
+        }
+    }
+
+    private suspend fun prepareRemoteInput(
+        scope: CoroutineScope,
+        uri: Uri,
+        header: EcdcHeader,
+        startSample: Long,
+    ): PreparedRemoteInput {
+        val prefix = remoteHeaderPrefixes[uri.toString()] ?: HttpsStreams.readPrefix(
+            uri.toString(), STATIC_HEADER_PREFIX_BYTES,
+        ).also { remoteHeaderPrefixes[uri.toString()] = it }
+        require(prefix.size >= 9) { "Remote ECDC header is incomplete" }
+        val metadataSize = ((prefix[5].toInt() and 0xff) shl 24) or
+            ((prefix[6].toInt() and 0xff) shl 16) or
+            ((prefix[7].toInt() and 0xff) shl 8) or (prefix[8].toInt() and 0xff)
+        val headerSize = 9 + metadataSize
+        require(headerSize in 9..prefix.size) { "Remote ECDC metadata exceeds 1 KiB" }
+        val exactHeader = prefix.copyOf(headerSize)
+        val stride = requireNotNull(header.variant.segmentStrideSamples)
+        val frameIndex = (startSample / stride).toInt()
+        val fullFrameBits = header.numCodebooks * header.variant.frameRate * 10
+        val frameBytes = 4 + (fullFrameBits + 7) / 8
+        val rangeStart = headerSize.toLong() + frameIndex.toLong() * frameBytes
+        val startupBytes = (header.nominalBitrateBps * STATIC_STARTUP_SECONDS / 8)
+            .coerceIn(STATIC_MIN_STARTUP_BYTES, STATIC_MAX_STARTUP_BYTES) + headerSize
+        val input = DownloadAheadInputStream.open(
+            scope = scope,
+            startupBytes = startupBytes,
+            sourceProvider = {
+                SequenceInputStream(
+                    ByteArrayInputStream(exactHeader),
+                    HttpsStreams.openRange(uri.toString(), rangeStart),
+                )
+            },
+        )
+        return PreparedRemoteInput(input, frameIndex)
+    }
+
+    private data class PreparedRemoteInput(
+        val input: InputStream,
+        val initialFrameIndex: Int,
+    )
 
     private fun validateHeader(header: EcdcHeader) {
         require(!header.usesLanguageModel) {

@@ -51,8 +51,11 @@ removed.
   emulators and restrictive audio devices.
 - Legacy minimum-buffer PCM16 output on Android 8.0/8.1 and API 27 AVDs.
 - Per-file duration, codebook count, sample rate, and nominal bitrate.
-- Progressive playback from a direct HTTPS URL without downloading the entire
-  file first.
+- Static HTTPS files use exact ECDC frame byte ranges and bounded background
+  download-ahead buffering, so playback and seeking do not require a complete
+  download or a scan from byte zero.
+- Adding a static URL uses a 1 KiB HTTP Range request for ECDC inspection rather
+  than opening and abandoning a full-file response.
 - HTTPS-to-HTTP redirects are accepted. The app therefore enables Android's
   global cleartext-traffic setting; do not use untrusted stream addresses.
 - Native EnCodec Live v1 playback from rolling `stream.json` manifests over
@@ -68,8 +71,7 @@ removed.
 - One ExecuTorch decoder and one `AudioTrack` are retained across normal live
   segment boundaries.
 
-Remote seeking currently reconnects and scans the stream from the beginning.
-HTTP Range-based seeking and a permanent download cache are not implemented.
+Static URL seeking requires an HTTP server that honors byte-range requests.
 
 ## Playing an EnCodec livestream
 

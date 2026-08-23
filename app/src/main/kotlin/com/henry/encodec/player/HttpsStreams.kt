@@ -32,6 +32,50 @@ internal object HttpsStreams {
         throw lastError ?: IOException("Could not open the stream")
     }
 
+    fun openRange(url: String, startByte: Long): InputStream {
+        require(startByte >= 0)
+        return openOnce(
+            url = url,
+            noCache = false,
+            allowInitialHttp = false,
+            rangeStartInclusive = startByte,
+            disconnectOnClose = true,
+        )
+    }
+
+    /** Reads only enough of a static file to inspect its ECDC header. */
+    fun readPrefix(url: String, maxBytes: Int): ByteArray {
+        require(maxBytes > 0)
+        var lastError: IOException? = null
+        repeat(MAX_OPEN_ATTEMPTS) { attempt ->
+            try {
+                openOnce(
+                    url = url,
+                    noCache = false,
+                    allowInitialHttp = false,
+                    rangeEndInclusive = maxBytes - 1,
+                ).use { input ->
+                    val output = ByteArrayOutputStream(maxBytes)
+                    val buffer = ByteArray(8 * 1024)
+                    while (output.size() < maxBytes) {
+                        val read = input.read(
+                            buffer,
+                            0,
+                            minOf(buffer.size, maxBytes - output.size()),
+                        )
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                    }
+                    return output.toByteArray()
+                }
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt < MAX_OPEN_ATTEMPTS - 1) Thread.sleep(500L * (attempt + 1))
+            }
+        }
+        throw lastError ?: IOException("Could not inspect the remote file")
+    }
+
     /** Cancellable, bounded HTTP(S) download used by live manifests and segments. */
     suspend fun readBytes(url: String, maxBytes: Int, noCache: Boolean = false): ByteArray =
         withContext(Dispatchers.IO) {
@@ -92,6 +136,9 @@ internal object HttpsStreams {
         noCache: Boolean,
         allowInitialHttp: Boolean,
         onConnection: (HttpURLConnection) -> Unit = {},
+        rangeStartInclusive: Long? = null,
+        rangeEndInclusive: Int? = null,
+        disconnectOnClose: Boolean = false,
     ): InputStream {
         var current = URI(url)
         require(
@@ -110,7 +157,13 @@ internal object HttpsStreams {
             connection.readTimeout = 30_000
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Accept-Encoding", "identity")
-            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.2")
+            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.4")
+            if (rangeStartInclusive != null || rangeEndInclusive != null) {
+                connection.setRequestProperty(
+                    "Range",
+                    "bytes=${rangeStartInclusive ?: 0}-${rangeEndInclusive ?: ""}",
+                )
+            }
             if (noCache) {
                 connection.useCaches = false
                 connection.setRequestProperty("Cache-Control", "no-cache, no-store")
@@ -119,7 +172,15 @@ internal object HttpsStreams {
 
             val status = connection.responseCode
             if (status in 200..299) {
-                return KeepAliveInputStream(connection.inputStream)
+                if (rangeStartInclusive != null && rangeStartInclusive > 0 && status != 206) {
+                    connection.disconnect()
+                    throw IOException("Server ignored the ECDC byte-range request")
+                }
+                return if (disconnectOnClose) {
+                    DisconnectingInputStream(connection.inputStream, connection)
+                } else {
+                    KeepAliveInputStream(connection.inputStream)
+                }
             }
             if (status in 300..399 && redirectCount < MAX_REDIRECTS) {
                 val location = connection.getHeaderField("Location")
@@ -136,4 +197,17 @@ internal object HttpsStreams {
     }
 
     private class KeepAliveInputStream(source: InputStream) : FilterInputStream(source)
+
+    private class DisconnectingInputStream(
+        source: InputStream,
+        private val connection: HttpURLConnection,
+    ) : FilterInputStream(source) {
+        override fun close() {
+            try {
+                super.close()
+            } finally {
+                connection.disconnect()
+            }
+        }
+    }
 }

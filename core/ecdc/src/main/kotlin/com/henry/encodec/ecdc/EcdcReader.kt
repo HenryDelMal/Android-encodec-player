@@ -7,11 +7,13 @@ import java.nio.charset.StandardCharsets
 import kotlin.math.ceil
 import kotlin.math.min
 
-class EcdcReader(input: InputStream) : AutoCloseable {
+class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable {
     private val source = DataInputStream(BufferedInputStream(input))
     val header: EcdcHeader = readHeader(source)
-    private var framesRead = 0
     private val frameCount = frameCount(header)
+    private var framesRead = initialFrameIndex.also {
+        require(it in 0..frameCount) { "Invalid initial ECDC frame index: $it" }
+    }
     private val monoBits = if (header.variant == EncodecVariant.MONO_24_KHZ) {
         BitUnpacker(10, source)
     } else {

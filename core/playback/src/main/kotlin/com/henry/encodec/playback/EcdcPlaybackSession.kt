@@ -35,9 +35,10 @@ class EcdcPlaybackSession(
     suspend fun play(
         input: InputStream,
         startSample: Long = 0,
+        initialFrameIndex: Int = 0,
         onProgress: (Float) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        EcdcReader(input).use { reader ->
+        EcdcReader(input, initialFrameIndex).use { reader ->
             require(reader.header.variant == decoder.variant) {
                 "File uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
             }
@@ -50,7 +51,8 @@ class EcdcPlaybackSession(
                     val stride = reader.header.variant.segmentStrideSamples
                         ?: reader.header.audioLengthSamples.toInt()
                     val targetFrameIndex = (requestedStart / stride).toInt()
-                    repeat(targetFrameIndex) {
+                    require(initialFrameIndex <= targetFrameIndex)
+                    repeat(targetFrameIndex - initialFrameIndex) {
                         if (stopRequested) return@withContext
                         reader.readFrame() ?: return@withContext
                     }

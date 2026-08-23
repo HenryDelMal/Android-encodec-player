@@ -12,8 +12,8 @@ android {
         applicationId = "com.henry.encodec.player"
         minSdk = 26
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.8.2"
+        versionCode = 21
+        versionName = "0.8.4"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
