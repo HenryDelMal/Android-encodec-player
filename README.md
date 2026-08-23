@@ -57,6 +57,10 @@ removed.
   global cleartext-traffic setting; do not use untrusted stream addresses.
 - Native EnCodec Live v1 playback from rolling `stream.json` manifests over
   HTTP or HTTPS.
+- Two verified segments are buffered before live playback starts, with up to
+  three segments prefetched in the background to absorb network jitter.
+- Live manifest windows are consumed locally and fully read HTTP responses
+  reuse keep-alive connections, reducing repeated DNS and TLS work.
 - Live-edge startup, manifest polling, ordered sequence playback, cleanup-window
   recovery, explicit discontinuity handling, reconnect, and Jump to live.
 - Manifest/segment size limits plus ECDC header, byte-length, and SHA-256
@@ -77,14 +81,19 @@ https://example.com/stream/stream.json
 
 Then choose **Open livestream**. HTTP is also accepted for trusted local-network
 servers. The app validates EnCodec Live v1 and begins approximately two
-segments behind the live edge. Live mode displays connection status, sequence,
-bitrate, and codebooks. Seeking, previous/next, shuffle, and repeat are disabled
+segments behind the live edge after buffering two verified segments. Live mode
+displays connection status, queued segment count, sequence, bitrate, and
+codebooks. Seeking, previous/next, shuffle, and repeat are disabled
 until **Disconnect** returns the app to normal playlist mode.
 
 The last live URL is remembered, but playback never starts automatically when
 the app launches. The server must publish complete, independent ECDC v0 files
 using the `encodec_48khz` model, 48 kHz stereo, 2/4/8/16 codebooks, and no
 language-model entropy coding.
+
+For a compatible encoder, rolling-manifest generator, and server setup, see the
+[EnCodec Live Streamer](https://github.com/HenryDelMal/encodec-live-streamer)
+project.
 
 ## Upstream projects
 

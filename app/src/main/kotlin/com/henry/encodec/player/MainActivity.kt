@@ -379,6 +379,7 @@ private fun NowPlaying(state: PlayerState) {
             val details = buildList {
                 live.bandwidthKbps?.let { add("${formatNumber(it)} kbps") }
                 live.codebooks?.let { add("$it codebooks") }
+                add("${live.bufferedSegments} buffered")
                 add("48 kHz stereo")
             }
             Text(details.joinToString(" • "), style = MaterialTheme.typography.bodySmall)

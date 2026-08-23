@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.2
+
+- Added a background queue of up to three downloaded, integrity-verified live
+  segments and require two segments before starting live playback.
+- Cached manifest windows so already-published segments are consumed without a
+  redundant manifest request before every segment.
+- Allowed fully consumed HTTP responses to reuse keep-alive sockets, reducing
+  repeated DNS lookups and TLS handshakes.
+- Added live buffer-depth and explicit rebuffering status in the player UI.
+- Linked the companion
+  [EnCodec Live Streamer](https://github.com/HenryDelMal/encodec-live-streamer)
+  project in the livestream documentation.
+
 ## 0.8.1
 
 - Changed the example live manifest URL into a placeholder so the URL field is

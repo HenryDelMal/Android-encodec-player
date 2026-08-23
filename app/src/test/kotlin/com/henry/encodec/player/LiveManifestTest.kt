@@ -149,6 +149,27 @@ class LiveManifestTest {
         assertTrue(cancelled || job.isCancelled)
     }
 
+    @Test
+    fun cachedManifestSuppliesFollowingSegmentsWithoutAnotherPoll() = runBlocking {
+        val bytes = ecdcHeader(96_000, 8)
+        val hash = bytes.sha256()
+        var manifestFetches = 0
+        val source = LiveStreamSource(
+            MANIFEST_URL,
+            fetchManifestBytes = {
+                manifestFetches++
+                manifestJson(
+                    (1L..3L).map { segment(it, bytes.size, hash) },
+                ).toByteArray()
+            },
+            fetchSegmentBytes = { bytes },
+        )
+
+        assertEquals(1L, source.nextSegment {}.sequence)
+        assertEquals(2L, source.nextSegment {}.sequence)
+        assertEquals(1, manifestFetches)
+    }
+
     private fun manifest(segments: List<LiveSegmentInfo>) = LiveManifest(
         mediaSequence = segments.firstOrNull()?.sequence ?: 0,
         discontinuitySequence = 0,
@@ -182,11 +203,15 @@ class LiveManifestTest {
         }
     """.trimIndent()
 
-    private fun segment(sequence: Long): String = """
+    private fun segment(
+        sequence: Long,
+        byteLength: Int = 100,
+        sha256: String = "a".repeat(64),
+    ): String = """
         {"sequence":$sequence,"uri":"segment-$sequence.ecdc","duration":2.0,
          "sample_count":96000,"pts_samples":${sequence * 96_000},
          "program_date_time":"2026-08-23T00:00:00Z","epoch":"$EPOCH_1",
-         "discontinuity":false,"byte_length":100,"sha256":"${"a".repeat(64)}"}
+         "discontinuity":false,"byte_length":$byteLength,"sha256":"$sha256"}
     """.trimIndent()
 
     private fun ecdcHeader(samples: Long, codebooks: Int): ByteArray {

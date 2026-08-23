@@ -29,6 +29,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -37,6 +40,7 @@ import java.io.File
 import java.io.InputStream
 import java.io.ByteArrayInputStream
 import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicInteger
 
 data class PlaylistItem(
     val uri: Uri,
@@ -51,6 +55,7 @@ data class LiveUiState(
     val sequence: Long? = null,
     val codebooks: Int? = null,
     val bandwidthKbps: Double? = null,
+    val bufferedSegments: Int = 0,
 )
 
 enum class RepeatMode {
@@ -455,44 +460,84 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         maxCodebooks = config.maxCodebooks,
                         modelTimeSteps = config.timeSteps,
                     ).use { decoder ->
-                        val source = LiveStreamSource(live.manifestUrl)
-                        val newSession = LiveEcdcPlaybackSession(decoder)
-                        liveSession = newSession
-                        newSession.play(
-                            nextSegment = {
-                                val downloaded = source.nextSegment { status ->
-                                    if (playbackGeneration == generation) {
-                                        mutableState.value = mutableState.value.copy(
-                                            live = mutableState.value.live?.copy(status = status),
-                                        )
-                                    }
-                                }
-                                if (playbackGeneration == generation) {
-                                    mutableState.value = mutableState.value.copy(
-                                        live = mutableState.value.live?.copy(
-                                            status = "Decoding segment ${downloaded.sequence}…",
-                                            codebooks = downloaded.codebooks,
-                                            bandwidthKbps = downloaded.bandwidthKbps,
-                                        ),
-                                    )
-                                }
-                                LiveEcdcSegment(
-                                    ByteArrayInputStream(downloaded.bytes),
-                                    downloaded.sequence,
-                                    downloaded.discontinuity,
+                        coroutineScope {
+                            val source = LiveStreamSource(live.manifestUrl)
+                            val queue = Channel<DownloadedLiveSegment>(LIVE_PREFETCH_CAPACITY)
+                            val buffered = AtomicInteger(0)
+                            fun publishBuffer(status: String? = null) {
+                                if (playbackGeneration != generation) return
+                                val depth = buffered.get()
+                                mutableState.value = mutableState.value.copy(
+                                    live = mutableState.value.live?.copy(
+                                        status = status ?: if (depth > 0) "LIVE" else "Rebuffering…",
+                                        bufferedSegments = depth,
+                                    ),
                                 )
-                            },
-                            onSegmentPlaying = { sequence ->
-                                if (playbackGeneration == generation) {
-                                    mutableState.value = mutableState.value.copy(
-                                        live = mutableState.value.live?.copy(
-                                            status = "LIVE",
-                                            sequence = sequence,
-                                        ),
-                                    )
+                            }
+                            val producer = launch(Dispatchers.IO) {
+                                try {
+                                    while (isActive) {
+                                        val downloaded = source.nextSegment { status ->
+                                            if (buffered.get() == 0) publishBuffer(status)
+                                        }
+                                        buffered.incrementAndGet()
+                                        try {
+                                            queue.send(downloaded)
+                                        } catch (error: Throwable) {
+                                            buffered.decrementAndGet()
+                                            throw error
+                                        }
+                                        publishBuffer()
+                                    }
+                                } finally {
+                                    queue.close()
                                 }
-                            },
-                        )
+                            }
+                            try {
+                                publishBuffer("Buffering live audio…")
+                                while (buffered.get() < LIVE_STARTUP_SEGMENTS) {
+                                    // Let the producer fill the channel without
+                                    // consuming the first verified segments.
+                                    kotlinx.coroutines.delay(25)
+                                    if (producer.isCompleted) break
+                                }
+                                val newSession = LiveEcdcPlaybackSession(decoder)
+                                liveSession = newSession
+                                newSession.play(
+                                    nextSegment = {
+                                        if (buffered.get() == 0) publishBuffer("Rebuffering…")
+                                        val downloaded = queue.receive()
+                                        buffered.decrementAndGet()
+                                        publishBuffer("Decoding segment ${downloaded.sequence}…")
+                                        mutableState.value = mutableState.value.copy(
+                                            live = mutableState.value.live?.copy(
+                                                codebooks = downloaded.codebooks,
+                                                bandwidthKbps = downloaded.bandwidthKbps,
+                                            ),
+                                        )
+                                        LiveEcdcSegment(
+                                            ByteArrayInputStream(downloaded.bytes),
+                                            downloaded.sequence,
+                                            downloaded.discontinuity,
+                                        )
+                                    },
+                                    onSegmentPlaying = { sequence ->
+                                        if (playbackGeneration == generation) {
+                                            mutableState.value = mutableState.value.copy(
+                                                live = mutableState.value.live?.copy(
+                                                    status = "LIVE",
+                                                    sequence = sequence,
+                                                    bufferedSegments = buffered.get(),
+                                                ),
+                                            )
+                                        }
+                                    },
+                                )
+                            } finally {
+                                producer.cancelAndJoin()
+                                queue.cancel()
+                            }
+                        }
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -804,6 +849,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.CYCLE_REPEAT"
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
+        private const val LIVE_STARTUP_SEGMENTS = 2
+        private const val LIVE_PREFETCH_CAPACITY = 3
 
         internal fun dispatchMediaAction(action: String?) {
             val player = activeInstance?.get() ?: return

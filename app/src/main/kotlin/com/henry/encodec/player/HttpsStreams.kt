@@ -66,10 +66,16 @@ internal object HttpsStreams {
                                 }
                                 output.write(buffer, 0, read)
                             }
-                            return@withContext output.toByteArray()
+                            val result = output.toByteArray()
+                            // A fully consumed response can return its socket to
+                            // HttpURLConnection's keep-alive pool. This avoids a
+                            // fresh DNS lookup and TLS handshake per segment.
+                            activeConnection.set(null)
+                            return@withContext result
                         }
                     } catch (error: IOException) {
                         coroutineContext.ensureActive()
+                        activeConnection.getAndSet(null)?.disconnect()
                         lastError = error
                         if (attempt < MAX_OPEN_ATTEMPTS - 1) delay(500L * (attempt + 1))
                     }
@@ -104,7 +110,7 @@ internal object HttpsStreams {
             connection.readTimeout = 30_000
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Accept-Encoding", "identity")
-            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.0")
+            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.2")
             if (noCache) {
                 connection.useCaches = false
                 connection.setRequestProperty("Cache-Control", "no-cache, no-store")
@@ -113,7 +119,7 @@ internal object HttpsStreams {
 
             val status = connection.responseCode
             if (status in 200..299) {
-                return DisconnectingInputStream(connection.inputStream, connection)
+                return KeepAliveInputStream(connection.inputStream)
             }
             if (status in 300..399 && redirectCount < MAX_REDIRECTS) {
                 val location = connection.getHeaderField("Location")
@@ -129,16 +135,5 @@ internal object HttpsStreams {
         throw IOException("Too many HTTP redirects")
     }
 
-    private class DisconnectingInputStream(
-        source: InputStream,
-        private val connection: HttpURLConnection,
-    ) : FilterInputStream(source) {
-        override fun close() {
-            try {
-                super.close()
-            } finally {
-                connection.disconnect()
-            }
-        }
-    }
+    private class KeepAliveInputStream(source: InputStream) : FilterInputStream(source)
 }

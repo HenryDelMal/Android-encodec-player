@@ -191,29 +191,44 @@ class LiveStreamSource(
 ) {
     private val tracker = LiveSequenceTracker()
     private var retryCount = 0
+    private var cachedManifest: LiveManifest? = null
+    private var streamInit: LiveCodecInit? = null
 
     suspend fun nextSegment(onStatus: (String) -> Unit): DownloadedLiveSegment {
         while (currentCoroutineContext().isActive) {
             try {
-                onStatus(if (retryCount == 0) "Checking live edge…" else "Reconnecting…")
-                val manifest = LiveManifestParser.parse(
-                    fetchManifestBytes().toString(Charsets.UTF_8),
-                    manifestUrl,
-                )
-                val selected = tracker.select(manifest)
+                var manifest = cachedManifest
+                var selected = manifest?.let(tracker::select)
                 if (selected == null) {
-                    onStatus("Waiting for sequence ${tracker.expectedSequence() ?: manifest.mediaSequence}…")
-                    delay(pollDelayMillis(manifest))
+                    onStatus(if (retryCount == 0) "Checking live edge…" else "Reconnecting…")
+                    manifest = LiveManifestParser.parse(
+                        fetchManifestBytes().toString(Charsets.UTF_8),
+                        manifestUrl,
+                    )
+                    val expectedInit = streamInit
+                    if (expectedInit != null && manifest.init != expectedInit) {
+                        throw LiveProtocolException("Live codec initialization changed")
+                    }
+                    streamInit = manifest.init
+                    cachedManifest = manifest
+                    selected = tracker.select(manifest)
+                }
+                val activeManifest = manifest
+                    ?: throw LiveProtocolException("Live manifest was not available")
+                if (selected == null) {
+                    onStatus("Waiting for sequence ${tracker.expectedSequence() ?: activeManifest.mediaSequence}…")
+                    delay(pollDelayMillis(activeManifest))
+                    cachedManifest = null
                     continue
                 }
                 onStatus("Buffering segment ${selected.sequence}…")
                 val bytes = fetchSegmentBytes(selected.url)
-                verifySegment(bytes, selected, manifest.init)
+                verifySegment(bytes, selected, activeManifest.init)
                 val accepted = tracker.accept(selected)
                 retryCount = 0
                 return DownloadedLiveSegment(
                     bytes, selected.sequence, accepted.discontinuity,
-                    manifest.init.codebooks, manifest.init.bandwidthKbps,
+                    activeManifest.init.codebooks, activeManifest.init.bandwidthKbps,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -228,7 +243,11 @@ class LiveStreamSource(
         throw CancellationException("Live stream stopped")
     }
 
-    fun jumpToLive() = tracker.reset()
+    fun jumpToLive() {
+        tracker.reset()
+        cachedManifest = null
+        streamInit = null
+    }
 
     private fun pollDelayMillis(manifest: LiveManifest): Long =
         (manifest.targetDuration * 500).toLong().coerceIn(250L, 5_000L)
