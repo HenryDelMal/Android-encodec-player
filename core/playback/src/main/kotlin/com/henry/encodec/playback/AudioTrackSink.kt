@@ -36,6 +36,14 @@ class AudioTrackSink(
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
     }
 
+    /** Drop queued PCM and reset playback timing at an explicit discontinuity. */
+    @Synchronized
+    fun flushQueued() {
+        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
+        track.flush()
+        framesWritten = 0L
+    }
+
     /**
      * Uses short non-blocking writes so a track change can stop this writer without
      * another thread stopping or releasing AudioTrack underneath it.

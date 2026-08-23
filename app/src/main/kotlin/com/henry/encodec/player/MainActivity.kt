@@ -9,7 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -21,9 +20,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -45,11 +45,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.painterResource
 import com.henry.encodec.ecdc.EcdcHeader
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-    private val playerModel: PlayerViewModel by viewModels()
+    private val playerModel: PlayerViewModel by lazy {
+        (application as PlayerApplication).playerModel
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,6 +77,8 @@ class MainActivity : ComponentActivity() {
             ACTION_PLAY_PAUSE -> playerModel.playPause()
             ACTION_PREVIOUS -> playerModel.previous()
             ACTION_NEXT -> playerModel.next()
+            ACTION_STOP -> playerModel.stop()
+            ACTION_JUMP_LIVE -> playerModel.jumpToLive()
         }
     }
 
@@ -82,6 +87,8 @@ class MainActivity : ComponentActivity() {
         const val ACTION_PLAY_PAUSE = "com.henry.encodec.player.PLAY_PAUSE"
         const val ACTION_PREVIOUS = "com.henry.encodec.player.PREVIOUS"
         const val ACTION_NEXT = "com.henry.encodec.player.NEXT"
+        const val ACTION_STOP = "com.henry.encodec.player.STOP"
+        const val ACTION_JUMP_LIVE = "com.henry.encodec.player.JUMP_TO_LIVE"
     }
 }
 
@@ -91,7 +98,7 @@ private fun PlayerScreen(model: PlayerViewModel) {
     var sliderPosition by remember { mutableFloatStateOf(0f) }
     var draggingSlider by remember { mutableStateOf(false) }
     var showUrlDialog by remember { mutableStateOf(false) }
-    var urlText by remember { mutableStateOf("https://") }
+    var urlText by remember { mutableStateOf(model.lastLiveUrl()) }
     LaunchedEffect(state.progress) {
         if (!draggingSlider) sliderPosition = state.progress
     }
@@ -118,33 +125,45 @@ private fun PlayerScreen(model: PlayerViewModel) {
                 enabled = !state.addingUrl,
                 onClick = { showUrlDialog = true },
             ) { Text(if (state.addingUrl) "Checking…" else "Open URL") }
-            OutlinedButton(
+            IconButton(
                 enabled = state.playlist.isNotEmpty(),
                 onClick = model::clearPlaylist,
-            ) { Text("Clear") }
+            ) {
+                Icon(
+                    painterResource(android.R.drawable.ic_menu_delete),
+                    contentDescription = "Delete all playlist items",
+                )
+            }
         }
 
         NowPlaying(state)
 
-        Slider(
-            value = sliderPosition,
-            enabled = state.current != null,
-            onValueChange = {
-                draggingSlider = true
-                sliderPosition = it
-            },
-            onValueChangeFinished = {
-                model.seekToFraction(sliderPosition)
-                draggingSlider = false
-            },
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            val durationSeconds = state.current?.let {
-                it.header.audioLengthSamples / it.header.variant.sampleRate
-            } ?: 0L
-            Text(formatTime((durationSeconds * sliderPosition).toLong()))
-            Text(formatTime(durationSeconds))
+        if (state.live == null) {
+            Slider(
+                value = sliderPosition,
+                enabled = state.current != null,
+                onValueChange = {
+                    draggingSlider = true
+                    sliderPosition = it
+                },
+                onValueChangeFinished = {
+                    model.seekToFraction(sliderPosition)
+                    draggingSlider = false
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                val durationSeconds = state.current?.let {
+                    it.header.audioLengthSamples / it.header.variant.sampleRate
+                } ?: 0L
+                Text(formatTime((durationSeconds * sliderPosition).toLong()))
+                Text(formatTime(durationSeconds))
+            }
+        } else {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("LIVE", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                Text(state.live?.sequence?.let { "Sequence $it" } ?: "Buffering")
+            }
         }
 
         Row(
@@ -152,30 +171,87 @@ private fun PlayerScreen(model: PlayerViewModel) {
             horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedButton(
-                enabled = state.currentIndex > 0,
+            IconButton(
+                enabled = state.live == null && (state.currentIndex > 0 ||
+                    (state.repeatMode == RepeatMode.LIST && state.playlist.isNotEmpty())),
                 onClick = model::previous,
-            ) { Text("Previous") }
-            Button(
-                enabled = state.current != null,
+            ) {
+                Icon(
+                    painterResource(android.R.drawable.ic_media_previous),
+                    contentDescription = "Previous",
+                )
+            }
+            IconButton(
+                enabled = state.current != null || state.live != null,
                 onClick = model::playPause,
             ) {
+                if (state.playing && !state.paused) {
+                    Icon(painterResource(android.R.drawable.ic_media_pause), contentDescription = "Pause")
+                } else {
+                    Icon(painterResource(android.R.drawable.ic_media_play), contentDescription = "Play")
+                }
+            }
+            IconButton(
+                enabled = state.playing || state.paused,
+                onClick = model::stop,
+            ) {
+                Icon(
+                    painterResource(android.R.drawable.ic_menu_close_clear_cancel),
+                    contentDescription = "Stop",
+                )
+            }
+            IconButton(
+                enabled = state.live == null && state.playlist.size > 1 &&
+                    (state.shuffle || state.currentIndex < state.playlist.lastIndex ||
+                        state.repeatMode == RepeatMode.LIST),
+                onClick = model::next,
+            ) {
+                Icon(
+                    painterResource(android.R.drawable.ic_media_next),
+                    contentDescription = "Next",
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                enabled = state.live == null && state.playlist.isNotEmpty(),
+                onClick = model::toggleShuffle,
+            ) { Text(if (state.shuffle) "Shuffle: On" else "Shuffle: Off") }
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                enabled = state.live == null && state.playlist.isNotEmpty(),
+                onClick = model::cycleRepeatMode,
+            ) {
                 Text(
-                    when {
-                        state.paused -> "Resume"
-                        state.playing -> "Pause"
-                        else -> "Play"
+                    when (state.repeatMode) {
+                        RepeatMode.OFF -> "Loop: Off"
+                        RepeatMode.TRACK -> "Loop: Track"
+                        RepeatMode.LIST -> "Loop: List"
                     },
                 )
             }
-            OutlinedButton(
-                enabled = state.playing || state.paused,
-                onClick = model::stop,
-            ) { Text("Stop") }
-            OutlinedButton(
-                enabled = state.currentIndex in 0 until state.playlist.lastIndex,
-                onClick = model::next,
-            ) { Text("Next") }
+        }
+
+        state.live?.let {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(modifier = Modifier.weight(1f), onClick = model::reconnectLive) {
+                    Text("Reconnect")
+                }
+                OutlinedButton(modifier = Modifier.weight(1f), onClick = model::jumpToLive) {
+                    Text("Jump to live")
+                }
+                OutlinedButton(modifier = Modifier.weight(1f), onClick = model::disconnectLive) {
+                    Text("Disconnect")
+                }
+            }
         }
 
         Text(
@@ -188,7 +264,7 @@ private fun PlayerScreen(model: PlayerViewModel) {
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             itemsIndexed(state.playlist, key = { _, item -> item.uri.toString() }) { index, item ->
-                val selected = index == state.currentIndex
+                val selected = state.live == null && index == state.currentIndex
                 Card(
                     modifier = Modifier.fillMaxWidth().clickable { model.selectTrack(index) },
                     colors = CardDefaults.cardColors(
@@ -199,22 +275,33 @@ private fun PlayerScreen(model: PlayerViewModel) {
                         },
                     ),
                 ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Text(
-                            text = "${index + 1}. ${item.title}",
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = buildString {
-                                if (item.uri.scheme.equals("https", ignoreCase = true)) append("HTTPS stream • ")
-                                append("${formatBitrate(item.header)} • ")
-                                append("${item.header.numCodebooks} codebooks • ")
-                                append("48 kHz stereo")
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                        )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${index + 1}. ${item.title}",
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = buildString {
+                                    if (item.uri.scheme.equals("https", ignoreCase = true)) append("HTTPS stream • ")
+                                    append("${formatBitrate(item.header)} • ")
+                                    append("${item.header.numCodebooks} codebooks • ")
+                                    append("48 kHz stereo")
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        IconButton(onClick = { model.removeTrack(index) }) {
+                            Icon(
+                                painterResource(android.R.drawable.ic_menu_delete),
+                                contentDescription = "Remove ${item.title}",
+                            )
+                        }
                     }
                 }
             }
@@ -226,14 +313,15 @@ private fun PlayerScreen(model: PlayerViewModel) {
     if (showUrlDialog) {
         AlertDialog(
             onDismissRequest = { showUrlDialog = false },
-            title = { Text("Open HTTPS stream") },
+            title = { Text("Open URL") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Enter the direct HTTPS address of an .ecdc file.")
+                    Text("Enter a finite HTTPS .ecdc URL or an HTTP(S) EnCodec live manifest URL.")
                     OutlinedTextField(
                         value = urlText,
                         onValueChange = { urlText = it },
-                        label = { Text("HTTPS URL") },
+                        label = { Text("URL") },
+                        placeholder = { Text("https://example.com/stream/stream.json") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                         modifier = Modifier.fillMaxWidth(),
@@ -241,13 +329,24 @@ private fun PlayerScreen(model: PlayerViewModel) {
                 }
             },
             confirmButton = {
-                TextButton(
-                    enabled = urlText.trim().length > "https://".length,
-                    onClick = {
-                        model.addUrl(urlText)
-                        showUrlDialog = false
-                    },
-                ) { Text("Add to playlist") }
+                Row {
+                    TextButton(
+                        enabled = urlText.trim().startsWith("https://", ignoreCase = true),
+                        onClick = {
+                            model.addUrl(urlText)
+                            showUrlDialog = false
+                        },
+                    ) { Text("Add file") }
+                    TextButton(
+                        enabled = urlText.trim().let {
+                            it.startsWith("http://", true) || it.startsWith("https://", true)
+                        },
+                        onClick = {
+                            model.openLive(urlText)
+                            showUrlDialog = false
+                        },
+                    ) { Text("Open livestream") }
+                }
             },
             dismissButton = {
                 TextButton(onClick = { showUrlDialog = false }) { Text("Cancel") }
@@ -265,16 +364,25 @@ private fun formatTime(totalSeconds: Long): String {
 
 @Composable
 private fun NowPlaying(state: PlayerState) {
+    val live = state.live
     val item = state.current
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text("Now playing", style = MaterialTheme.typography.labelLarge)
         Text(
-            text = item?.title ?: "Add .ecdc tracks to begin",
+            text = live?.title ?: item?.title ?: "Add .ecdc tracks or open a livestream",
             style = MaterialTheme.typography.titleLarge,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        if (item != null) {
+        if (live != null) {
+            Text(live.status, style = MaterialTheme.typography.bodyMedium)
+            val details = buildList {
+                live.bandwidthKbps?.let { add("${formatNumber(it)} kbps") }
+                live.codebooks?.let { add("$it codebooks") }
+                add("48 kHz stereo")
+            }
+            Text(details.joinToString(" • "), style = MaterialTheme.typography.bodySmall)
+        } else if (item != null) {
             Text(
                 "Track ${state.currentIndex + 1} of ${state.playlist.size}",
                 style = MaterialTheme.typography.bodyMedium,
@@ -286,6 +394,10 @@ private fun NowPlaying(state: PlayerState) {
         }
     }
 }
+
+private fun formatNumber(value: Double): String =
+    if (value % 1.0 == 0.0) value.toInt().toString()
+    else String.format(Locale.US, "%.2f", value).trimEnd('0').trimEnd('.')
 
 private fun formatBitrate(header: EcdcHeader): String {
     val kbps = header.nominalBitrateBps / 1_000.0

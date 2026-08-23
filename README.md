@@ -1,8 +1,8 @@
 # EnCodec Android Player
 
-An experimental Android player for HQ Meta EnCodec `.ecdc` files. It decodes
-the neural audio stream on the device with ExecuTorch and sends the resulting
-PCM audio to Android's `AudioTrack`.
+An experimental Android player for HQ Meta EnCodec `.ecdc` files and EnCodec
+Live v1 streams. It decodes the neural audio stream on the device with
+ExecuTorch and sends the resulting PCM audio to Android's `AudioTrack`.
 
 > [!CAUTION]
 > **This project is AI slop.** Most of its architecture, implementation,
@@ -27,6 +27,7 @@ This player deliberately supports only the official HQ EnCodec format:
 | ECDC container version | Version 0 |
 | Language-model entropy coding | No; encode without `--lm` |
 | 24 kHz mono/non-HQ EnCodec | No |
+| EnCodec Live protocol | `encodec-live-v1`, version 1 |
 
 The app recognizes 24 kHz non-HQ files but rejects them with a clear message.
 On-device testing showed that the non-HQ decoder could not maintain real-time
@@ -36,7 +37,15 @@ removed.
 ## Features
 
 - Local `.ecdc` file picker.
-- Playlist with play, pause, stop, previous, next, and seeking.
+- Persistent playlist with play, pause, stop, previous, next, and seeking.
+- Automatic playback when the first item is added and automatic advancement
+  when a track ends.
+- Shuffle and loop modes for one track or the whole playlist.
+- Per-track removal and a Delete all control.
+- Foreground playback with CPU and Wi-Fi wake locks for reliable playback while
+  the screen is locked.
+- Automatic retry for temporary DNS and connection failures when opening a
+  remote stream.
 - Android media-session and notification controls.
 - Adaptive `AudioTrack` creation with a 16-bit PCM fallback for Android
   emulators and restrictive audio devices.
@@ -46,10 +55,36 @@ removed.
   file first.
 - HTTPS-to-HTTP redirects are accepted. The app therefore enables Android's
   global cleartext-traffic setting; do not use untrusted stream addresses.
-- Automatic playback of the next playlist item.
+- Native EnCodec Live v1 playback from rolling `stream.json` manifests over
+  HTTP or HTTPS.
+- Live-edge startup, manifest polling, ordered sequence playback, cleanup-window
+  recovery, explicit discontinuity handling, reconnect, and Jump to live.
+- Manifest/segment size limits plus ECDC header, byte-length, and SHA-256
+  verification before a live segment is decoded.
+- One ExecuTorch decoder and one `AudioTrack` are retained across normal live
+  segment boundaries.
 
 Remote seeking currently reconnects and scans the stream from the beginning.
 HTTP Range-based seeking and a permanent download cache are not implemented.
+
+## Playing an EnCodec livestream
+
+Choose **Open URL**, enter a manifest address such as:
+
+```text
+https://example.com/stream/stream.json
+```
+
+Then choose **Open livestream**. HTTP is also accepted for trusted local-network
+servers. The app validates EnCodec Live v1 and begins approximately two
+segments behind the live edge. Live mode displays connection status, sequence,
+bitrate, and codebooks. Seeking, previous/next, shuffle, and repeat are disabled
+until **Disconnect** returns the app to normal playlist mode.
+
+The last live URL is remembered, but playback never starts automatically when
+the app launches. The server must publish complete, independent ECDC v0 files
+using the `encodec_48khz` model, 48 kHz stereo, 2/4/8/16 codebooks, and no
+language-model entropy coding.
 
 ## Upstream projects
 
@@ -79,7 +114,7 @@ retain their respective licenses.
 app/             Compose UI, playlist, URLs, and Android media controls
 core/ecdc/       ECDC header parser and raw 10-bit code unpacking
 core/decoder/    ExecuTorch model loading and EnCodec PCM decoding
-core/playback/   AudioTrack output, crossfading, progress, and seeking
+core/playback/   Persistent AudioTrack output, crossfading, finite and live playback
 tools/           Python model-export utility
 ```
 
@@ -160,13 +195,13 @@ app/src/main/assets/encodec_48khz_decoder.pte
 On macOS or Linux:
 
 ```bash
-./gradlew :core:ecdc:test assembleDebug
+./gradlew :core:ecdc:test :app:testDebugUnitTest assembleDebug
 ```
 
 On Windows:
 
 ```powershell
-.\gradlew.bat :core:ecdc:test assembleDebug
+.\gradlew.bat :core:ecdc:test :app:testDebugUnitTest assembleDebug
 ```
 
 The debug APK is written to:
@@ -198,6 +233,10 @@ supported by this app.
   settings, even when its audio output is compatible.
 - No gapless-playback guarantee.
 - Remote streams have no persistent cache or HTTP Range index.
+- Live playback uses a custom EnCodec protocol, not standard HLS; ordinary HLS
+  clients cannot play its manifests.
+- A connection failure during an individual segment download is retried, but a
+  server must retain segments long enough for cleanup-window recovery.
 - Global cleartext traffic is enabled to permit accepted HTTPS-to-HTTP
   redirects.
 - Universal debug builds are large because they include the neural model and
