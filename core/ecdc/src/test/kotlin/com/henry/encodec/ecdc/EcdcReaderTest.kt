@@ -64,6 +64,20 @@ class EcdcReaderTest {
         }
     }
 
+    @Test
+    fun `preserves exact header and calculates direct HQ frame offsets`() {
+        val bytes = file("encodec_48khz", 480_000, 4, false, intArrayOf())
+        val headerBytes = EcdcReader.readHeaderBytes(ByteArrayInputStream(bytes))
+        val header = EcdcReader.inspect(ByteArrayInputStream(headerBytes))
+        val bytesPerFrame = 4L + (4L * 150L * 10L + 7L) / 8L
+
+        assertContentEquals(bytes.copyOf(headerBytes.size), headerBytes)
+        assertEquals(
+            headerBytes.size.toLong() + 7L * bytesPerFrame,
+            EcdcReader.frameByteOffset(header, headerBytes.size, 7),
+        )
+    }
+
     private fun file(model: String, length: Int, codebooks: Int, lm: Boolean, codes: IntArray): ByteArray {
         val metadata = "{\"m\":\"$model\",\"al\":$length,\"nc\":$codebooks,\"lm\":$lm}"
         return ByteArrayOutputStream().also { bytes ->

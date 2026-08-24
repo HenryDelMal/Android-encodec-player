@@ -11,6 +11,7 @@ import kotlin.coroutines.coroutineContext
 
 class EcdcPlaybackSession(
     private val decoder: EncodecDecoder,
+    private val sharedSink: AudioTrackSink? = null,
 ) {
     @Volatile private var currentSink: AudioTrackSink? = null
     @Volatile private var paused = false
@@ -28,8 +29,9 @@ class EcdcPlaybackSession(
 
     fun stop() {
         stopRequested = true
-        // AudioTrack is stopped and released only by the playback thread,
-        // preventing Next/Previous from racing a native write.
+        // Writes are short, non-blocking, and synchronized with abortQueued().
+        // Drop decode-ahead immediately so a replacement session can start.
+        currentSink?.abortQueued()
     }
 
     suspend fun play(
@@ -42,9 +44,15 @@ class EcdcPlaybackSession(
             require(reader.header.variant == decoder.variant) {
                 "File uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
             }
-            AudioTrackSink(reader.header.variant.sampleRate, reader.header.variant.channels).use { sink ->
+            val ownsSink = sharedSink == null
+            val sink = sharedSink ?: AudioTrackSink(
+                reader.header.variant.sampleRate,
+                reader.header.variant.channels,
+            )
+            try {
                 currentSink = sink
                 try {
+                    sink.flushQueued()
                     sink.start()
                     if (paused) sink.pause()
                     val requestedStart = startSample.coerceIn(0, reader.header.audioLengthSamples - 1)
@@ -78,7 +86,9 @@ class EcdcPlaybackSession(
                     )
 
                     var emittedSamples = requestedStart
-                    var pending: DecodedPcm? = null
+                    // Retain only the short overlap tail. Keeping the complete
+                    // frame here delayed startup until frame 2 was decoded.
+                    var pendingTail: DecodedPcm? = null
                     var firstFrame = true
                     val overlapSamples = reader.header.variant.segmentSamples
                         ?.minus(reader.header.variant.segmentStrideSamples ?: 0)
@@ -103,28 +113,34 @@ class EcdcPlaybackSession(
                             emittedSamples += pcmFrames
                             continue
                         }
-                        val previous = pending
-                        if (previous == null) {
-                            pending = pcm
+                        val pcmFrames = pcm.samples.size / pcm.channels
+                        val previousTail = pendingTail
+                        if (previousTail == null) {
+                            val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(0)
+                            if (bodyEnd > 0) {
+                                if (!writeToSink(pcm.sliceFrames(0, bodyEnd))) break
+                                emittedSamples += bodyEnd
+                            }
+                            pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
                         } else {
                             val overlap = minOf(
                                 overlapSamples,
-                                previous.samples.size / previous.channels,
-                                pcm.samples.size / pcm.channels,
+                                previousTail.samples.size / previousTail.channels,
+                                pcmFrames,
                             )
-                            val keep = previous.samples.size / previous.channels - overlap
-                            if (keep > 0) {
-                                if (!writeToSink(previous.sliceFrames(0, keep))) break
-                                emittedSamples += keep
-                            }
                             if (overlap > 0) {
-                                if (!writeToSink(crossfade(previous, pcm, overlap))) break
+                                if (!writeToSink(crossfade(previousTail, pcm, overlap))) break
                                 emittedSamples += overlap
                             }
-                            pending = pcm.sliceFrames(overlap, pcm.samples.size / pcm.channels)
+                            val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(overlap)
+                            if (bodyEnd > overlap) {
+                                if (!writeToSink(pcm.sliceFrames(overlap, bodyEnd))) break
+                                emittedSamples += bodyEnd - overlap
+                            }
+                            pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
                         }
                     }
-                    pending?.let { last ->
+                    pendingTail?.let { last ->
                         val remaining = (reader.header.audioLengthSamples - emittedSamples)
                             .coerceAtMost(last.samples.size.toLong() / last.channels)
                             .toInt()
@@ -142,6 +158,8 @@ class EcdcPlaybackSession(
                 } finally {
                     currentSink = null
                 }
+            } finally {
+                if (ownsSink) sink.close()
             }
         }
     }

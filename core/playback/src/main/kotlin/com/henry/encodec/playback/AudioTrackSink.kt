@@ -44,6 +44,14 @@ class AudioTrackSink(
         framesWritten = 0L
     }
 
+    /** Immediately discard decode-ahead PCM when replacing this session. */
+    @Synchronized
+    fun abortQueued() {
+        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
+        track.flush()
+        framesWritten = 0L
+    }
+
     /**
      * Uses short non-blocking writes so a track change can stop this writer without
      * another thread stopping or releasing AudioTrack underneath it.
@@ -139,7 +147,12 @@ class AudioTrackSink(
 
     @Synchronized
     override fun close() {
-        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.stop()
+        // A streaming AudioTrack can contain several seconds of decode-ahead
+        // PCM. Discard it before stop/release so seeking never waits for stale
+        // audio to drain.
+        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
+        track.flush()
+        runCatching { track.stop() }
         track.release()
     }
 
@@ -249,6 +262,14 @@ class AudioTrackSink(
         if (candidate.state != AudioTrack.STATE_INITIALIZED) {
             candidate.release()
             error("AudioTrack was not initialized")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Streaming tracks default to a start threshold near their full
+            // capacity. This track is intentionally large for decode-ahead,
+            // but playback should begin after the platform's minimum buffer.
+            val bytesPerFrame = channels * bytesPerSample
+            val minimumFrames = (minBuffer / bytesPerFrame).coerceAtLeast(1)
+            candidate.setStartThresholdInFrames(minimumFrames)
         }
         return candidate
     }

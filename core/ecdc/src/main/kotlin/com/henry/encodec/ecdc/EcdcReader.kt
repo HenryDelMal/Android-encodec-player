@@ -117,6 +117,39 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
         fun inspect(input: InputStream): EcdcHeader =
             DataInputStream(BufferedInputStream(input)).use(::readHeader)
 
+        /** Reads exactly the version-0 header without consuming any code bytes. */
+        fun readHeaderBytes(input: InputStream): ByteArray {
+            val fixed = ByteArray(9)
+            DataInputStream(input).readFully(fixed)
+            if (!fixed.copyOfRange(0, 4).contentEquals(magic)) {
+                throw EcdcFormatException("File is not in ECDC format")
+            }
+            val metadataSize = ((fixed[5].toInt() and 0xff) shl 24) or
+                ((fixed[6].toInt() and 0xff) shl 16) or
+                ((fixed[7].toInt() and 0xff) shl 8) or
+                (fixed[8].toInt() and 0xff)
+            if (metadataSize !in 2..MAX_METADATA_BYTES) {
+                throw EcdcFormatException("Invalid ECDC metadata size: $metadataSize")
+            }
+            val metadata = ByteArray(metadataSize)
+            DataInputStream(input).readFully(metadata)
+            return fixed + metadata
+        }
+
+        /**
+         * Byte position of a 48 kHz HQ frame. Every complete HQ frame has a
+         * fixed-size scale value and a separately padded 10-bit code payload.
+         */
+        fun frameByteOffset(header: EcdcHeader, headerBytes: Int, frameIndex: Int): Long {
+            require(header.variant == EncodecVariant.STEREO_48_KHZ)
+            require(frameIndex >= 0)
+            val codeBitsPerFrame = header.numCodebooks.toLong() *
+                header.variant.frameRate * 10L
+            val scaleBytes = if (header.variant.normalized) 4L else 0L
+            val frameBytes = scaleBytes + (codeBitsPerFrame + 7L) / 8L
+            return headerBytes.toLong() + frameIndex.toLong() * frameBytes
+        }
+
         private fun readHeader(source: DataInputStream): EcdcHeader {
             val actualMagic = ByteArray(4).also(source::readFully)
             if (!actualMagic.contentEquals(magic)) throw EcdcFormatException("File is not in ECDC format")

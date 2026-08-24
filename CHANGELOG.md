@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.8.10
+
+- Restored the ExecuTorch decoder to four inference threads after device timing
+  confirmed approximately 190–260 ms per one-second HQ frame with substantial
+  real-time headroom.
+- Retained the Android 12+ low start-threshold fix responsible for the improved
+  local and HTTPS startup/seek latency.
+- Kept decoder timing in Logcat for performance comparisons on lower-range
+  devices.
+
+## 0.8.9
+
+- Lowered the Android 12+ streaming `AudioTrack` start threshold from its
+  decode-ahead capacity to the platform's minimum safe buffer, allowing sound
+  to begin without priming seconds of PCM.
+- Increased adaptive ExecuTorch inference parallelism from a hard four-thread
+  ceiling to as many as six threads on higher-core-count devices.
+- Added `EnCodecDecoder` Logcat timing for every decoder invocation to separate
+  neural inference time from input and audio-output latency during testing.
+
+## 0.8.8
+
+- Reused one persistent `AudioTrack` for finite local files, static HTTPS files,
+  seeking, track changes, and live streaming, matching the low-latency live
+  playback architecture.
+- Moved audio-device initialization into app startup alongside decoder preload.
+- Flushes the shared track at every session boundary so stale queued PCM is
+  discarded without reopening Android's audio output device.
+
+## 0.8.7
+
+- Removed a full-frame overlap pipeline stall that required two one-second HQ
+  frames to finish decoding before the first PCM reached `AudioTrack`.
+- Static and live playback now emit frame 1 immediately after its decoder call
+  and retain only the final 10 ms required to crossfade with frame 2.
+- Reduced startup and seek latency without removing EnCodec's segment-boundary
+  crossfade or changing the ECDC bitstream.
+
+## 0.8.6
+
+- Discarded queued `AudioTrack` decode-ahead PCM immediately when stopping,
+  seeking, or replacing a playback session instead of allowing stale audio to
+  delay the next session.
+- Began loading the HQ ExecuTorch decoder when the app opens so its one-time
+  initialization overlaps track selection.
+- Reduced static HTTPS startup buffering from roughly three seconds with a
+  2 KiB floor to roughly one second with a 512-byte floor, substantially
+  improving startup and range-seek latency for 3 kbps files.
+
+## 0.8.5
+
+- Kept the ExecuTorch HQ decoder loaded across normal playback, track changes,
+  HTTPS playback, live playback, and seeking instead of reloading the model.
+- Added direct compressed-frame seeking for local ECDC documents exposed
+  through seekable Android file descriptors.
+- Retained sequential local seeking as a compatibility fallback for virtual
+  and cloud-backed document providers that expose non-seekable streams.
+- Centralized exact HQ frame-offset calculation for local and HTTPS sources.
+
 ## 0.8.4
 
 - Added exact HQ ECDC frame-offset calculation for static URL seeking.

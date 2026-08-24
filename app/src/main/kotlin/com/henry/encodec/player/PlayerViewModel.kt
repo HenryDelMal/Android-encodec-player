@@ -7,6 +7,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.res.AssetFileDescriptor
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -20,6 +21,7 @@ import com.henry.encodec.ecdc.EcdcHeader
 import com.henry.encodec.ecdc.EcdcReader
 import com.henry.encodec.ecdc.EncodecVariant
 import com.henry.encodec.playback.EcdcPlaybackSession
+import com.henry.encodec.playback.AudioTrackSink
 import com.henry.encodec.playback.LiveEcdcPlaybackSession
 import com.henry.encodec.playback.LiveEcdcSegment
 import kotlinx.coroutines.CancellationException
@@ -40,6 +42,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import java.io.File
+import java.io.FileInputStream
+import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.ByteArrayInputStream
 import java.io.SequenceInputStream
@@ -97,6 +101,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private var requestedStartSample = 0L
     private val shufflePlayedUris = mutableSetOf<String>()
     private val decoderMutex = Mutex()
+    private var cachedDecoder: ExecuTorchEncodecDecoder? = null
+    private var cachedAudioSink: AudioTrackSink? = null
     private val remoteHeaderPrefixes = ConcurrentHashMap<String, ByteArray>()
     private val mediaSession = MediaSession(application, "EnCodec Player").apply {
         setCallback(object : MediaSession.Callback() {
@@ -120,6 +126,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     init {
         removeObsoleteDecoderModels()
         activeInstance = WeakReference(this)
+        // Loading the model is the largest one-time startup cost. Begin while
+        // the user is choosing a track instead of waiting for Play or Seek.
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                decoderMutex.withLock {
+                    val variant = EncodecVariant.STEREO_48_KHZ
+                    decoderFor(decoderConfig(variant), variant)
+                    audioSink()
+                }
+            }
+        }
         viewModelScope.launch {
             state.collect(::publishMediaState)
         }
@@ -498,19 +515,18 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             try {
                                 publishBuffer("Buffering live audio…")
                                 val config = decoderConfig(EncodecVariant.STEREO_48_KHZ)
-                                ExecuTorchEncodecDecoder(
-                                    copyAssetOnce(config.assetName),
+                                val decoder = decoderFor(
+                                    config,
                                     EncodecVariant.STEREO_48_KHZ,
-                                    maxCodebooks = config.maxCodebooks,
-                                    modelTimeSteps = config.timeSteps,
-                                ).use { decoder ->
+                                )
+                                run {
                                     while (buffered.get() < LIVE_STARTUP_SEGMENTS) {
                                         // The producer has been filling the queue
                                         // concurrently with decoder initialization.
                                         kotlinx.coroutines.delay(25)
                                         if (producer.isCompleted) break
                                     }
-                                    val newSession = LiveEcdcPlaybackSession(decoder)
+                                    val newSession = LiveEcdcPlaybackSession(decoder, audioSink())
                                     liveSession = newSession
                                     newSession.play(
                                         nextSegment = {
@@ -614,16 +630,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             null
                         }
-                        ExecuTorchEncodecDecoder(
-                            copyAssetOnce(config.assetName),
-                            item.header.variant,
-                            maxCodebooks = config.maxCodebooks,
-                            modelTimeSteps = config.timeSteps,
-                        ).use { decoder ->
-                            val newSession = EcdcPlaybackSession(decoder)
+                        val decoder = decoderFor(config, item.header.variant)
+                        run {
+                            val newSession = EcdcPlaybackSession(decoder, audioSink())
                             session = newSession
                             if (mutableState.value.paused) newSession.pause()
-                            withPlaybackInput(item.uri, preparedRemote) {
+                            withPlaybackInput(
+                                item.uri,
+                                item.header,
+                                trackStartSample,
+                                preparedRemote,
+                            ) {
                                     input, initialFrameIndex ->
                                 newSession.play(
                                     input = input,
@@ -848,7 +865,21 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        val runningPlayback = playbackJob
         stopInternal(resetProgress = false)
+        val decoderToClose = cachedDecoder
+        val sinkToClose = cachedAudioSink
+        cachedDecoder = null
+        cachedAudioSink = null
+        if (runningPlayback == null) {
+            sinkToClose?.close()
+            decoderToClose?.close()
+        } else {
+            runningPlayback.invokeOnCompletion {
+                sinkToClose?.close()
+                decoderToClose?.close()
+            }
+        }
         stopPlaybackService()
         val manager = getApplication<Application>()
             .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -871,9 +902,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         private const val LIVE_STARTUP_SEGMENTS = 2
         private const val LIVE_PREFETCH_CAPACITY = 3
         private const val STATIC_HEADER_PREFIX_BYTES = 1024
-        private const val STATIC_STARTUP_SECONDS = 3
-        private const val STATIC_MIN_STARTUP_BYTES = 2 * 1024
-        private const val STATIC_MAX_STARTUP_BYTES = 16 * 1024
+        private const val STATIC_STARTUP_SECONDS = 1
+        private const val STATIC_MIN_STARTUP_BYTES = 512
+        private const val STATIC_MAX_STARTUP_BYTES = 8 * 1024
 
         internal fun dispatchMediaAction(action: String?) {
             val player = activeInstance?.get() ?: return
@@ -973,6 +1004,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun <T> withPlaybackInput(
         uri: Uri,
+        header: EcdcHeader,
+        startSample: Long,
         preparedRemote: Deferred<PreparedRemoteInput>?,
         block: suspend (InputStream, Int) -> T,
     ): T = withContext(Dispatchers.IO) {
@@ -980,7 +1013,43 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             val prepared = requireNotNull(preparedRemote).await()
             prepared.input.use { block(it, prepared.initialFrameIndex) }
         } else {
-            openInput(uri).use { block(it, 0) }
+            prepareLocalInput(uri, header, startSample).let { prepared ->
+                prepared.input.use { block(it, prepared.initialFrameIndex) }
+            }
+        }
+    }
+
+    private fun prepareLocalInput(
+        uri: Uri,
+        header: EcdcHeader,
+        startSample: Long,
+    ): PreparedRemoteInput {
+        val stride = requireNotNull(header.variant.segmentStrideSamples)
+        val frameIndex = (startSample / stride).toInt()
+        if (frameIndex == 0) return PreparedRemoteInput(openInput(uri), 0)
+
+        // Android document providers commonly expose a seekable descriptor. Use
+        // it to jump directly to the requested ECDC frame. Cloud-backed and
+        // virtual providers can expose a pipe instead, so retain the old reader
+        // walk as a compatibility fallback.
+        val headerBytes = openInput(uri).use(EcdcReader::readHeaderBytes)
+        val rangeStart = EcdcReader.frameByteOffset(header, headerBytes.size, frameIndex)
+        val descriptor = getApplication<Application>().contentResolver
+            .openAssetFileDescriptor(uri, "r")
+            ?: return PreparedRemoteInput(openInput(uri), 0)
+        return try {
+            val positioned = descriptor.createInputStream()
+            positioned.channel.position(descriptor.startOffset + rangeStart)
+            PreparedRemoteInput(
+                SequenceInputStream(
+                    ByteArrayInputStream(headerBytes),
+                    DescriptorInputStream(positioned, descriptor),
+                ),
+                frameIndex,
+            )
+        } catch (_: Throwable) {
+            runCatching { descriptor.close() }
+            PreparedRemoteInput(openInput(uri), 0)
         }
     }
 
@@ -1002,9 +1071,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val exactHeader = prefix.copyOf(headerSize)
         val stride = requireNotNull(header.variant.segmentStrideSamples)
         val frameIndex = (startSample / stride).toInt()
-        val fullFrameBits = header.numCodebooks * header.variant.frameRate * 10
-        val frameBytes = 4 + (fullFrameBits + 7) / 8
-        val rangeStart = headerSize.toLong() + frameIndex.toLong() * frameBytes
+        val rangeStart = EcdcReader.frameByteOffset(header, headerSize, frameIndex)
         val startupBytes = (header.nominalBitrateBps * STATIC_STARTUP_SECONDS / 8)
             .coerceIn(STATIC_MIN_STARTUP_BYTES, STATIC_MAX_STARTUP_BYTES) + headerSize
         val input = DownloadAheadInputStream.open(
@@ -1024,6 +1091,19 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val input: InputStream,
         val initialFrameIndex: Int,
     )
+
+    private class DescriptorInputStream(
+        source: FileInputStream,
+        private val descriptor: AssetFileDescriptor,
+    ) : FilterInputStream(source) {
+        override fun close() {
+            try {
+                super.close()
+            } finally {
+                runCatching { descriptor.close() }
+            }
+        }
+    }
 
     private fun validateHeader(header: EcdcHeader) {
         require(!header.usesLanguageModel) {
@@ -1048,6 +1128,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val maxCodebooks: Int,
         val timeSteps: Int,
     )
+
+    /** Decoder initialization is expensive; one instance can serve all HQ sessions serially. */
+    private fun decoderFor(
+        config: DecoderConfig,
+        variant: EncodecVariant,
+    ): ExecuTorchEncodecDecoder = cachedDecoder ?: ExecuTorchEncodecDecoder(
+        copyAssetOnce(config.assetName),
+        variant,
+        maxCodebooks = config.maxCodebooks,
+        modelTimeSteps = config.timeSteps,
+    ).also { cachedDecoder = it }
+
+    private fun audioSink(): AudioTrackSink = cachedAudioSink ?: AudioTrackSink(
+        EncodecVariant.STEREO_48_KHZ.sampleRate,
+        EncodecVariant.STEREO_48_KHZ.channels,
+    ).also { cachedAudioSink = it }
 
     private fun copyAssetOnce(name: String): File {
         val filesDir = getApplication<Application>().filesDir

@@ -157,7 +157,7 @@ internal object HttpsStreams {
             connection.readTimeout = 30_000
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Accept-Encoding", "identity")
-            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.4")
+            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.10")
             if (rangeStartInclusive != null || rangeEndInclusive != null) {
                 connection.setRequestProperty(
                     "Range",

@@ -19,7 +19,10 @@ data class LiveEcdcSegment(
  * Opens every live segment as an independent ECDC file while keeping one
  * decoder and one AudioTrack for the complete live session.
  */
-class LiveEcdcPlaybackSession(private val decoder: EncodecDecoder) {
+class LiveEcdcPlaybackSession(
+    private val decoder: EncodecDecoder,
+    private val sharedSink: AudioTrackSink? = null,
+) {
     @Volatile private var currentSink: AudioTrackSink? = null
     @Volatile private var paused = false
     @Volatile private var stopRequested = false
@@ -36,15 +39,22 @@ class LiveEcdcPlaybackSession(private val decoder: EncodecDecoder) {
 
     fun stop() {
         stopRequested = true
+        currentSink?.abortQueued()
     }
 
     suspend fun play(
         nextSegment: suspend () -> LiveEcdcSegment,
         onSegmentPlaying: (Long) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        AudioTrackSink(decoder.variant.sampleRate, decoder.variant.channels).use { sink ->
+        val ownsSink = sharedSink == null
+        val sink = sharedSink ?: AudioTrackSink(
+            decoder.variant.sampleRate,
+            decoder.variant.channels,
+        )
+        try {
             currentSink = sink
             try {
+                sink.flushQueued()
                 sink.start()
                 if (paused) sink.pause()
                 var first = true
@@ -62,6 +72,8 @@ class LiveEcdcPlaybackSession(private val decoder: EncodecDecoder) {
             } finally {
                 currentSink = null
             }
+        } finally {
+            if (ownsSink) sink.close()
         }
     }
 
@@ -74,7 +86,9 @@ class LiveEcdcPlaybackSession(private val decoder: EncodecDecoder) {
             val overlapSamples = reader.header.variant.segmentSamples
                 ?.minus(reader.header.variant.segmentStrideSamples ?: 0) ?: 0
             var emittedSamples = 0
-            var pending: DecodedPcm? = null
+            // Retain only the overlap tail so frame 1 is audible after one
+            // decoder invocation instead of waiting for frame 2.
+            var pendingTail: DecodedPcm? = null
             while (!stopRequested) {
                 val frame = reader.readFrame() ?: break
                 val pcm = decoder.decode(frame)
@@ -83,20 +97,23 @@ class LiveEcdcPlaybackSession(private val decoder: EncodecDecoder) {
                     emittedSamples += pcm.frameCount
                     continue
                 }
-                val previous = pending
-                if (previous == null) {
-                    pending = pcm
+                val previousTail = pendingTail
+                if (previousTail == null) {
+                    val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(0)
+                    if (bodyEnd > 0 && !write(sink, pcm.sliceFrames(0, bodyEnd))) return
+                    emittedSamples += bodyEnd
+                    pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 } else {
-                    val overlap = minOf(overlapSamples, previous.frameCount, pcm.frameCount)
-                    val keep = previous.frameCount - overlap
-                    if (keep > 0 && !write(sink, previous.sliceFrames(0, keep))) return
-                    emittedSamples += keep
-                    if (overlap > 0 && !write(sink, crossfade(previous, pcm, overlap))) return
+                    val overlap = minOf(overlapSamples, previousTail.frameCount, pcm.frameCount)
+                    if (overlap > 0 && !write(sink, crossfade(previousTail, pcm, overlap))) return
                     emittedSamples += overlap
-                    pending = pcm.sliceFrames(overlap, pcm.frameCount)
+                    val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(overlap)
+                    if (bodyEnd > overlap && !write(sink, pcm.sliceFrames(overlap, bodyEnd))) return
+                    emittedSamples += bodyEnd - overlap
+                    pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 }
             }
-            pending?.let { last ->
+            pendingTail?.let { last ->
                 val remaining = (reader.header.audioLengthSamples - emittedSamples)
                     .coerceAtMost(last.frameCount.toLong()).toInt()
                 if (!stopRequested && remaining > 0) write(sink, last.sliceFrames(0, remaining))

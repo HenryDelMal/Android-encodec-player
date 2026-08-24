@@ -2,6 +2,7 @@ package com.henry.encodec.decoder
 
 import com.henry.encodec.ecdc.EcdcFrame
 import com.henry.encodec.ecdc.EncodecVariant
+import android.util.Log
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.pytorch.executorch.Tensor
@@ -30,6 +31,7 @@ class ExecuTorchEncodecDecoder(
     }
 
     override fun decode(frame: EcdcFrame): DecodedPcm {
+        val startedNanos = System.nanoTime()
         require(frame.codebookCount <= maxCodebooks) {
             "${frame.codebookCount} codebooks exceed model capacity $maxCodebooks"
         }
@@ -69,7 +71,14 @@ class ExecuTorchEncodecDecoder(
                     output[channel * availablePerChannel + outputStart + sample] * scale
             }
         }
-        return DecodedPcm(interleaved, variant.sampleRate, variant.channels)
+        return DecodedPcm(interleaved, variant.sampleRate, variant.channels).also {
+            val elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000L
+            Log.i(
+                "EnCodecDecoder",
+                "Decoded ${frame.timeSteps} steps (${frame.codebookCount} codebooks) " +
+                    "in ${elapsedMillis}ms",
+            )
+        }
     }
 
     override fun close() {
