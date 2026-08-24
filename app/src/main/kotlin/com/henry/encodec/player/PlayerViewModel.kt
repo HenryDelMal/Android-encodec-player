@@ -65,6 +65,8 @@ data class LiveUiState(
     val codebooks: Int? = null,
     val bandwidthKbps: Double? = null,
     val bufferedSegments: Int = 0,
+    val targetBufferedSegments: Int = 2,
+    val buffering: Boolean = true,
 )
 
 enum class RepeatMode {
@@ -278,7 +280,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         if (mutableState.value.live == null) return
         stopInternal(resetProgress = false)
         mutableState.value = mutableState.value.copy(
-            live = mutableState.value.live?.copy(status = status, sequence = null),
+            live = mutableState.value.live?.copy(
+                status = status,
+                sequence = null,
+                bufferedSegments = 0,
+                buffering = true,
+            ),
             error = null,
         )
         startLivePlayback()
@@ -475,7 +482,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 playing = true,
                 paused = false,
                 error = null,
-                live = mutableState.value.live?.copy(status = "Loading decoder…"),
+                live = mutableState.value.live?.copy(
+                    status = "Loading decoder…",
+                    buffering = true,
+                ),
             )
             try {
                 decoderMutex.withLock {
@@ -483,21 +493,30 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             val source = LiveStreamSource(live.manifestUrl)
                             val queue = Channel<DownloadedLiveSegment>(LIVE_PREFETCH_CAPACITY)
                             val buffered = AtomicInteger(0)
-                            fun publishBuffer(status: String? = null) {
+                            val targetBuffer = AtomicInteger(LIVE_STARTUP_SEGMENTS)
+                            val rebufferEvents = AtomicInteger(0)
+                            fun publishBuffer(
+                                status: String? = null,
+                                buffering: Boolean? = null,
+                            ) {
                                 if (playbackGeneration != generation) return
                                 val depth = buffered.get()
                                 mutableState.value = mutableState.value.copy(
                                     live = mutableState.value.live?.copy(
                                         status = status ?: if (depth > 0) "LIVE" else "Rebuffering…",
                                         bufferedSegments = depth,
+                                        targetBufferedSegments = targetBuffer.get(),
+                                        buffering = buffering ?: mutableState.value.live?.buffering ?: false,
                                     ),
                                 )
                             }
                             val producer = launch(Dispatchers.IO) {
                                 try {
+                                    // Keep preparing manifest-listed segments in
+                                    // the background until the queue is full.
                                     while (isActive) {
                                         val downloaded = source.nextSegment { status ->
-                                            if (buffered.get() == 0) publishBuffer(status)
+                                            if (buffered.get() == 0) publishBuffer(status, buffering = true)
                                         }
                                         buffered.incrementAndGet()
                                         try {
@@ -513,16 +532,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                 }
                             }
                             try {
-                                publishBuffer("Buffering live audio…")
+                                publishBuffer("Buffering live audio…", buffering = true)
                                 val config = decoderConfig(EncodecVariant.STEREO_48_KHZ)
                                 val decoder = decoderFor(
                                     config,
                                     EncodecVariant.STEREO_48_KHZ,
                                 )
                                 run {
-                                    while (buffered.get() < LIVE_STARTUP_SEGMENTS) {
+                                    while (buffered.get() < targetBuffer.get()) {
                                         // The producer has been filling the queue
                                         // concurrently with decoder initialization.
+                                        publishBuffer(
+                                            "Buffering ${buffered.get()}/${targetBuffer.get()} segments…",
+                                            buffering = true,
+                                        )
                                         kotlinx.coroutines.delay(25)
                                         if (producer.isCompleted) break
                                     }
@@ -530,10 +553,29 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     liveSession = newSession
                                     newSession.play(
                                         nextSegment = {
-                                            if (buffered.get() == 0) publishBuffer("Rebuffering…")
+                                            if (buffered.get() == 0) {
+                                                val events = rebufferEvents.incrementAndGet()
+                                                if (events % REBUFFERS_PER_BUFFER_INCREASE == 0) {
+                                                    targetBuffer.updateAndGet { current ->
+                                                        (current + 1).coerceAtMost(LIVE_MAX_BUFFER_SEGMENTS)
+                                                    }
+                                                }
+                                                while (buffered.get() < targetBuffer.get() &&
+                                                    !producer.isCompleted
+                                                ) {
+                                                    publishBuffer(
+                                                        "Rebuffering ${buffered.get()}/${targetBuffer.get()} segments…",
+                                                        buffering = true,
+                                                    )
+                                                    kotlinx.coroutines.delay(50)
+                                                }
+                                            }
                                             val downloaded = queue.receive()
                                             buffered.decrementAndGet()
-                                            publishBuffer("Decoding segment ${downloaded.sequence}…")
+                                            publishBuffer(
+                                                "Decoding segment ${downloaded.sequence}…",
+                                                buffering = false,
+                                            )
                                             mutableState.value = mutableState.value.copy(
                                                 live = mutableState.value.live?.copy(
                                                     codebooks = downloaded.codebooks,
@@ -553,6 +595,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                                         status = "LIVE",
                                                         sequence = sequence,
                                                         bufferedSegments = buffered.get(),
+                                                        targetBufferedSegments = targetBuffer.get(),
+                                                        buffering = false,
                                                     ),
                                                 )
                                             }
@@ -900,7 +944,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
         private const val LIVE_STARTUP_SEGMENTS = 2
-        private const val LIVE_PREFETCH_CAPACITY = 3
+        private const val LIVE_MAX_BUFFER_SEGMENTS = 6
+        private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
+        private const val REBUFFERS_PER_BUFFER_INCREASE = 1
         private const val STATIC_HEADER_PREFIX_BYTES = 1024
         private const val STATIC_STARTUP_SECONDS = 1
         private const val STATIC_MIN_STARTUP_BYTES = 512

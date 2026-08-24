@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.11
+
+- Restored the proven v0.8.10 playback and manifest-fetching architecture after
+  the first adaptive-buffer implementation caused a playback regression.
+- Live playback still starts with two buffered segments; after every actual
+  rebuffer event, the refill target grows by one segment, up to six.
+- Continues downloading and preparing upcoming manifest-listed segments in a
+  background producer until the six-segment queue is full.
+- Reuses every available segment in the current `stream.json` and requests a
+  new manifest only after that list is exhausted. Initial selection remains two
+  listed segments behind the live edge.
+- Added a loading spinner plus current/target segment counts during initial
+  buffering and recovery.
+
 ## 0.8.10
 
 - Restored the ExecuTorch decoder to four inference threads after device timing
