@@ -57,7 +57,9 @@ class AudioTrackSink(
      * kernel instead of polling a full buffer every 5 ms. Each write is bounded
      * to about 20 ms of audio, preserving responsive pause and stop behavior.
      * Paused tracks retain non-blocking writes because their buffers cannot
-     * drain until playback resumes.
+     * drain until playback resumes. The kernel write must not hold this
+     * object's monitor: pause, stop and seek use it to interrupt playback from
+     * the main thread.
      */
     fun write(
         pcm: DecodedPcm,
@@ -77,14 +79,12 @@ class AudioTrackSink(
         var offset = 0
         while (offset < samples.size && !shouldStop()) {
             val requested = minOf(samples.size - offset, writeChunkSamples)
-            val written = synchronized(this) {
-                track.write(
-                    samples,
-                    offset,
-                    requested,
-                    writeMode(),
-                )
-            }
+            val written = track.write(
+                samples,
+                offset,
+                requested,
+                writeMode(),
+            )
             check(written >= 0) { "AudioTrack float write failed: $written" }
             onPlaybackAdvanced(playedFrames())
             if (written == 0) {
@@ -111,14 +111,12 @@ class AudioTrackSink(
         var offset = 0
         while (offset < converted.size && !shouldStop()) {
             val requested = minOf(converted.size - offset, writeChunkSamples)
-            val written = synchronized(this) {
-                track.write(
-                    converted,
-                    offset,
-                    requested,
-                    writeMode(),
-                )
-            }
+            val written = track.write(
+                converted,
+                offset,
+                requested,
+                writeMode(),
+            )
             check(written >= 0) { "AudioTrack 16-bit write failed: $written" }
             onPlaybackAdvanced(playedFrames())
             if (written == 0) {

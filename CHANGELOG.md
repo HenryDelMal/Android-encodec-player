@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.2
+
+- Restored immediate livestream startup after the first verified segment instead
+  of waiting for the three-segment adaptive rebuffer target.
+- Live segments continue downloading into the bounded queue in the background
+  while the first approximately 4–5 second segment is decoded and played.
+- Initial startup no longer counts as a rebuffer event or increases the adaptive
+  buffer target.
+- Moved native model loading, model changes and `AudioTrack` creation off the UI
+  thread so playback buttons remain responsive during setup.
+- Prevented bounded blocking `AudioTrack` writes from holding the monitor needed
+  by pause, stop and seek controls.
+
 ## 0.10.1
 
 - Added support for the optional top-level EnCodec Live `title` field.

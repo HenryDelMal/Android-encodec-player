@@ -112,6 +112,9 @@ private data class MediaPublishKey(
     val livePhase: String?,
 )
 
+internal fun requiredLiveBufferDepth(deliveredSegments: Int, rebufferTarget: Int): Int =
+    if (deliveredSegments == 0) 1 else rebufferTarget.coerceAtLeast(1)
+
 class PlayerViewModel(application: Application) : AndroidViewModel(application) {
     private val playlistStore = PlaylistStore(application)
     private val mutableState = MutableStateFlow(playlistStore.load())
@@ -564,7 +567,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             val source = LiveStreamSource(live.manifestUrl)
                             val queue = Channel<DownloadedLiveSegment>(LIVE_PREFETCH_CAPACITY)
                             val buffered = AtomicInteger(0)
-                            val targetBuffer = AtomicInteger(LIVE_STARTUP_SEGMENTS)
+                            val targetBuffer = AtomicInteger(LIVE_REBUFFER_TARGET_SEGMENTS)
                             val rebufferEvents = AtomicInteger(0)
                             fun publishBuffer(
                                 status: String? = null,
@@ -632,47 +635,47 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             try {
                                 publishBuffer("Buffering live audio…", buffering = true)
                                 val config = decoderConfig(streamInit.variant)
-                                val decoder = decoderFor(
-                                    config,
-                                    streamInit.variant,
-                                )
+                                val (decoder, sink) = withContext(Dispatchers.IO) {
+                                    decoderFor(config, streamInit.variant) to
+                                        audioSink(streamInit.variant)
+                                }
                                 run {
-                                    while (buffered.get() < targetBuffer.get()) {
-                                        // The producer has been filling the queue
-                                        // concurrently with decoder initialization.
-                                        publishBuffer(
-                                            "Buffering ${buffered.get()}/${targetBuffer.get()} segments…",
-                                            buffering = true,
-                                        )
-                                        kotlinx.coroutines.delay(25)
-                                        if (producer.isCompleted) break
-                                    }
                                     val newSession = LiveEcdcPlaybackSession(
                                         decoder,
-                                        audioSink(streamInit.variant),
+                                        sink,
                                     )
                                     liveSession = newSession
+                                    var deliveredSegments = 0
                                     newSession.play(
                                         nextSegment = {
                                             if (buffered.get() == 0) {
-                                                val events = rebufferEvents.incrementAndGet()
-                                                if (events % REBUFFERS_PER_BUFFER_INCREASE == 0) {
-                                                    targetBuffer.updateAndGet { current ->
-                                                        (current + 1).coerceAtMost(LIVE_MAX_BUFFER_SEGMENTS)
+                                                if (deliveredSegments > 0) {
+                                                    val events = rebufferEvents.incrementAndGet()
+                                                    if (events % REBUFFERS_PER_BUFFER_INCREASE == 0) {
+                                                        targetBuffer.updateAndGet { current ->
+                                                            (current + 1).coerceAtMost(LIVE_MAX_BUFFER_SEGMENTS)
+                                                        }
                                                     }
                                                 }
-                                                while (buffered.get() < targetBuffer.get() &&
+                                                val requiredDepth = requiredLiveBufferDepth(
+                                                    deliveredSegments,
+                                                    targetBuffer.get(),
+                                                )
+                                                while (buffered.get() < requiredDepth &&
                                                     !producer.isCompleted
                                                 ) {
-                                                    publishBuffer(
-                                                        "Rebuffering ${buffered.get()}/${targetBuffer.get()} segments…",
-                                                        buffering = true,
-                                                    )
+                                                    val status = if (deliveredSegments == 0) {
+                                                        "Waiting for first live segment…"
+                                                    } else {
+                                                        "Rebuffering ${buffered.get()}/$requiredDepth segments…"
+                                                    }
+                                                    publishBuffer(status, buffering = true)
                                                     kotlinx.coroutines.delay(50)
                                                 }
                                             }
                                             val downloaded = queue.receive()
                                             buffered.decrementAndGet()
+                                            deliveredSegments++
                                             publishBuffer(
                                                 "Decoding segment ${downloaded.sequence}…",
                                                 buffering = false,
@@ -775,11 +778,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             null
                         }
-                        val decoder = decoderFor(config, item.header.variant)
+                        val (decoder, sink) = withContext(Dispatchers.IO) {
+                            decoderFor(config, item.header.variant) to
+                                audioSink(item.header.variant)
+                        }
                         run {
                             val newSession = EcdcPlaybackSession(
                                 decoder,
-                                audioSink(item.header.variant),
+                                sink,
                             )
                             session = newSession
                             if (mutableState.value.paused) newSession.pause()
@@ -1075,7 +1081,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.CYCLE_REPEAT"
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
-        private const val LIVE_STARTUP_SEGMENTS = 3
+        private const val LIVE_REBUFFER_TARGET_SEGMENTS = 3
         private const val LIVE_MAX_BUFFER_SEGMENTS = 6
         private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
         private const val REBUFFERS_PER_BUFFER_INCREASE = 1

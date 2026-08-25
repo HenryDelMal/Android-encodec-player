@@ -60,8 +60,10 @@ Language-model entropy coding is not supported for either variant.
   global cleartext-traffic setting; do not use untrusted stream addresses.
 - Native EnCodec Live v1 playback from rolling `stream.json` manifests over
   HTTP or HTTPS.
-- Three verified segments are buffered at startup, and the bounded background
-  queue grows after rebuffering events to absorb poor-network jitter.
+- Playback starts after the first verified live segment. Further segments are
+  downloaded into a bounded background queue while that segment plays, and the
+  rebuffer target grows after actual rebuffer events to absorb poor-network
+  jitter.
 - Live manifest windows are consumed locally and fully read HTTP responses
   reuse keep-alive connections, reducing repeated DNS and TLS work.
 - Live-edge startup, manifest polling, ordered sequence playback, cleanup-window
@@ -83,8 +85,8 @@ https://example.com/stream/stream.json
 
 Then choose **Open**. HTTP is also accepted for trusted local-network servers.
 The app validates EnCodec Live v1, saves the address in the Livestreams menu,
-and starts behind the protected live edge after buffering three verified
-segments. Live mode displays connection status, queued segment count, sequence,
+and starts behind the protected live edge after downloading its first verified
+segment. Live mode displays connection status, queued segment count, sequence,
 bitrate, and codebooks. Seeking, previous/next, shuffle, and repeat are disabled
 until **Disconnect** returns the app to normal playlist mode.
 

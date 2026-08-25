@@ -67,6 +67,12 @@ class LiveManifestTest {
     }
 
     @Test
+    fun startsPlaybackWithOneSegmentButUsesTargetAfterARebuffer() {
+        assertEquals(1, requiredLiveBufferDepth(deliveredSegments = 0, rebufferTarget = 3))
+        assertEquals(3, requiredLiveBufferDepth(deliveredSegments = 1, rebufferTarget = 3))
+    }
+
+    @Test
     fun unchangedManifestDoesNotDuplicateSequence() {
         val tracker = LiveSequenceTracker()
         val manifest = manifest(listOf(info(20)))
