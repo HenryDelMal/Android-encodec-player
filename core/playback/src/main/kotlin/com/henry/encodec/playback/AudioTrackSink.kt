@@ -10,8 +10,8 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 class AudioTrackSink(
-    private val sampleRate: Int,
-    private val channels: Int,
+    val sampleRate: Int,
+    val channels: Int,
 ) : AutoCloseable {
     private var framesWritten = 0L
     private val channelMask = if (channels == 1) {
@@ -53,8 +53,11 @@ class AudioTrackSink(
     }
 
     /**
-     * Uses short non-blocking writes so a track change can stop this writer without
-     * another thread stopping or releasing AudioTrack underneath it.
+     * Uses short blocking writes while playing so AudioTrack sleeps in the
+     * kernel instead of polling a full buffer every 5 ms. Each write is bounded
+     * to about 20 ms of audio, preserving responsive pause and stop behavior.
+     * Paused tracks retain non-blocking writes because their buffers cannot
+     * drain until playback resumes.
      */
     fun write(
         pcm: DecodedPcm,
@@ -73,18 +76,19 @@ class AudioTrackSink(
     ): Boolean {
         var offset = 0
         while (offset < samples.size && !shouldStop()) {
+            val requested = minOf(samples.size - offset, writeChunkSamples)
             val written = synchronized(this) {
                 track.write(
                     samples,
                     offset,
-                    samples.size - offset,
-                    AudioTrack.WRITE_NON_BLOCKING,
+                    requested,
+                    writeMode(),
                 )
             }
             check(written >= 0) { "AudioTrack float write failed: $written" }
             onPlaybackAdvanced(playedFrames())
             if (written == 0) {
-                Thread.sleep(5)
+                Thread.sleep(AUDIO_RETRY_DELAY_MS)
                 continue
             }
             offset += written
@@ -106,18 +110,19 @@ class AudioTrackSink(
         }
         var offset = 0
         while (offset < converted.size && !shouldStop()) {
+            val requested = minOf(converted.size - offset, writeChunkSamples)
             val written = synchronized(this) {
                 track.write(
                     converted,
                     offset,
-                    converted.size - offset,
-                    AudioTrack.WRITE_NON_BLOCKING,
+                    requested,
+                    writeMode(),
                 )
             }
             check(written >= 0) { "AudioTrack 16-bit write failed: $written" }
             onPlaybackAdvanced(playedFrames())
             if (written == 0) {
-                Thread.sleep(5)
+                Thread.sleep(AUDIO_RETRY_DELAY_MS)
                 continue
             }
             offset += written
@@ -144,6 +149,16 @@ class AudioTrackSink(
 
     /** Number of PCM frames that have actually reached the playback device. */
     fun playedFrames(): Long = track.playbackHeadPosition.toLong() and 0xffff_ffffL
+
+    private val writeChunkSamples: Int
+        get() = (sampleRate / AUDIO_WRITE_CHUNKS_PER_SECOND).coerceAtLeast(1) * channels
+
+    private fun writeMode(): Int =
+        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+            AudioTrack.WRITE_BLOCKING
+        } else {
+            AudioTrack.WRITE_NON_BLOCKING
+        }
 
     @Synchronized
     override fun close() {
@@ -293,5 +308,7 @@ class AudioTrackSink(
     private companion object {
         const val DECODE_AHEAD_SECONDS = 6
         const val EMULATOR_BUFFER_SECONDS = 2
+        const val AUDIO_WRITE_CHUNKS_PER_SECOND = 50
+        const val AUDIO_RETRY_DELAY_MS = 20L
     }
 }

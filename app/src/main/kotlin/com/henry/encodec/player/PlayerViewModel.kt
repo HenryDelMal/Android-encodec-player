@@ -16,7 +16,8 @@ import android.os.Build
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.henry.encodec.decoder.ExecuTorchEncodecDecoder
+import com.henry.encodec.decoder.CppEncodecDecoder
+import com.henry.encodec.decoder.EncodecDecoder
 import com.henry.encodec.ecdc.EcdcHeader
 import com.henry.encodec.ecdc.EcdcReader
 import com.henry.encodec.ecdc.EncodecVariant
@@ -32,6 +33,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
@@ -57,6 +59,11 @@ data class PlaylistItem(
     val header: EcdcHeader,
 )
 
+data class SavedLiveStream(
+    val manifestUrl: String,
+    val title: String,
+)
+
 data class LiveUiState(
     val manifestUrl: String,
     val title: String,
@@ -64,6 +71,7 @@ data class LiveUiState(
     val sequence: Long? = null,
     val codebooks: Int? = null,
     val bandwidthKbps: Double? = null,
+    val variant: EncodecVariant? = null,
     val bufferedSegments: Int = 0,
     val targetBufferedSegments: Int = 2,
     val buffering: Boolean = true,
@@ -79,6 +87,7 @@ enum class RepeatMode {
 
 data class PlayerState(
     val playlist: List<PlaylistItem> = emptyList(),
+    val livestreams: List<SavedLiveStream> = emptyList(),
     val currentIndex: Int = -1,
     val playing: Boolean = false,
     val paused: Boolean = false,
@@ -92,6 +101,17 @@ data class PlayerState(
     val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
 }
 
+private data class MediaPublishKey(
+    val currentUri: String?,
+    val liveUrl: String?,
+    val playing: Boolean,
+    val paused: Boolean,
+    val shuffle: Boolean,
+    val repeatMode: RepeatMode,
+    val positionSecond: Long,
+    val livePhase: String?,
+)
+
 class PlayerViewModel(application: Application) : AndroidViewModel(application) {
     private val playlistStore = PlaylistStore(application)
     private val mutableState = MutableStateFlow(playlistStore.load())
@@ -103,7 +123,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private var requestedStartSample = 0L
     private val shufflePlayedUris = mutableSetOf<String>()
     private val decoderMutex = Mutex()
-    private var cachedDecoder: ExecuTorchEncodecDecoder? = null
+    private var cachedDecoder: EncodecDecoder? = null
     private var cachedAudioSink: AudioTrackSink? = null
     private val remoteHeaderPrefixes = ConcurrentHashMap<String, ByteArray>()
     private val mediaSession = MediaSession(application, "EnCodec Player").apply {
@@ -135,12 +155,15 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 decoderMutex.withLock {
                     val variant = EncodecVariant.STEREO_48_KHZ
                     decoderFor(decoderConfig(variant), variant)
-                    audioSink()
+                    audioSink(variant)
                 }
             }
         }
         viewModelScope.launch {
-            state.collect(::publishMediaState)
+            // Playback position changes frequently. Android's media session can
+            // extrapolate between updates, so rebuilding the notification for
+            // every UI progress tick only steals time from Compose and audio.
+            state.distinctUntilChangedBy(::mediaPublishKey).collect(::publishMediaState)
         }
     }
 
@@ -238,6 +261,28 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /** Select finite ECDC playback or EnCodec Live from the URL path. */
+    fun openUrl(rawUrl: String) {
+        val text = rawUrl.trim()
+        val uri = runCatching { Uri.parse(text) }.getOrNull()
+        if (uri == null ||
+            !(uri.scheme.equals("https", true) || uri.scheme.equals("http", true)) ||
+            uri.host.isNullOrBlank()
+        ) {
+            mutableState.value = mutableState.value.copy(
+                error = "Enter a valid HTTP or HTTPS URL",
+            )
+            return
+        }
+        when {
+            uri.path.orEmpty().endsWith(".ecdc", ignoreCase = true) -> addUrl(text)
+            uri.path.orEmpty().endsWith(".json", ignoreCase = true) -> openLive(text)
+            else -> mutableState.value = mutableState.value.copy(
+                error = "The URL must end in .ecdc for a file or .json for a livestream",
+            )
+        }
+    }
+
     fun lastLiveUrl(): String = playlistStore.loadLastLiveUrl()
 
     fun openLive(rawUrl: String) {
@@ -255,14 +300,38 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         requestedStartSample = 0
         stopInternal(resetProgress = true)
         playlistStore.saveLastLiveUrl(uri.toString())
-        mutableState.value = mutableState.value.copy(
-            live = LiveUiState(uri.toString(), Uri.decode(uri.host ?: "EnCodec live")),
+        val stream = SavedLiveStream(uri.toString(), liveDisplayName(uri))
+        val snapshot = mutableState.value
+        val savedStreams = if (snapshot.livestreams.any { it.manifestUrl == stream.manifestUrl }) {
+            snapshot.livestreams
+        } else {
+            snapshot.livestreams + stream
+        }
+        mutableState.value = snapshot.copy(
+            livestreams = savedStreams,
+            live = LiveUiState(stream.manifestUrl, stream.title),
             playing = false,
             paused = false,
             progress = 0f,
             error = null,
         )
+        persistPlaylist()
         startLivePlayback()
+    }
+
+    fun removeLiveStream(index: Int) {
+        val snapshot = mutableState.value
+        if (index !in snapshot.livestreams.indices) return
+        mutableState.value = snapshot.copy(
+            livestreams = snapshot.livestreams.toMutableList().apply { removeAt(index) },
+        )
+        persistPlaylist()
+    }
+
+    fun clearLiveStreams() {
+        if (mutableState.value.livestreams.isEmpty()) return
+        mutableState.value = mutableState.value.copy(livestreams = emptyList())
+        persistPlaylist()
     }
 
     fun disconnectLive() {
@@ -423,6 +492,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         stopInternal(resetProgress = true)
         stopPlaybackService()
         mutableState.value = PlayerState(
+            livestreams = snapshot.livestreams,
             shuffle = snapshot.shuffle,
             repeatMode = snapshot.repeatMode,
         )
@@ -510,6 +580,16 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     ),
                                 )
                             }
+                            val streamInit = source.initialize { status ->
+                                publishBuffer(status, buffering = true)
+                            }
+                            mutableState.value = mutableState.value.copy(
+                                live = mutableState.value.live?.copy(
+                                    variant = streamInit.variant,
+                                    codebooks = streamInit.codebooks,
+                                    bandwidthKbps = streamInit.bandwidthKbps,
+                                ),
+                            )
                             val producer = launch(Dispatchers.IO) {
                                 try {
                                     // Keep preparing manifest-listed segments in
@@ -533,10 +613,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             }
                             try {
                                 publishBuffer("Buffering live audio…", buffering = true)
-                                val config = decoderConfig(EncodecVariant.STEREO_48_KHZ)
+                                val config = decoderConfig(streamInit.variant)
                                 val decoder = decoderFor(
                                     config,
-                                    EncodecVariant.STEREO_48_KHZ,
+                                    streamInit.variant,
                                 )
                                 run {
                                     while (buffered.get() < targetBuffer.get()) {
@@ -549,7 +629,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                         kotlinx.coroutines.delay(25)
                                         if (producer.isCompleted) break
                                     }
-                                    val newSession = LiveEcdcPlaybackSession(decoder, audioSink())
+                                    val newSession = LiveEcdcPlaybackSession(
+                                        decoder,
+                                        audioSink(streamInit.variant),
+                                    )
                                     liveSession = newSession
                                     newSession.play(
                                         nextSegment = {
@@ -676,7 +759,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         }
                         val decoder = decoderFor(config, item.header.variant)
                         run {
-                            val newSession = EcdcPlaybackSession(decoder, audioSink())
+                            val newSession = EcdcPlaybackSession(
+                                decoder,
+                                audioSink(item.header.variant),
+                            )
                             session = newSession
                             if (mutableState.value.paused) newSession.pause()
                             withPlaybackInput(
@@ -817,6 +903,34 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         publishMediaNotification(state)
     }
 
+    private fun mediaPublishKey(state: PlayerState): MediaPublishKey {
+        val current = state.current
+        val positionSecond = if (state.live == null && current != null) {
+            val durationSeconds = current.header.audioLengthSamples.toDouble() /
+                current.header.variant.sampleRate
+            (durationSeconds * state.progress).toLong()
+        } else {
+            0L
+        }
+        val livePhase = state.live?.let { live ->
+            when {
+                !state.playing -> live.status
+                live.buffering -> "buffering"
+                else -> "live"
+            }
+        }
+        return MediaPublishKey(
+            currentUri = current?.uri?.toString(),
+            liveUrl = state.live?.manifestUrl,
+            playing = state.playing,
+            paused = state.paused,
+            shuffle = state.shuffle,
+            repeatMode = state.repeatMode,
+            positionSecond = positionSecond,
+            livePhase = livePhase,
+        )
+    }
+
     private fun publishMediaNotification(state: PlayerState) {
         val manager = getApplication<Application>()
             .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -943,7 +1057,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.CYCLE_REPEAT"
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
-        private const val LIVE_STARTUP_SEGMENTS = 2
+        private const val LIVE_STARTUP_SEGMENTS = 3
         private const val LIVE_MAX_BUFFER_SEGMENTS = 6
         private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
         private const val REBUFFERS_PER_BUFFER_INCREASE = 1
@@ -1040,6 +1154,16 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         return Uri.decode(pathName ?: uri.host ?: "HTTPS stream")
     }
 
+    private fun liveDisplayName(uri: Uri): String {
+        val host = Uri.decode(uri.host ?: "EnCodec live")
+        val streamName = uri.pathSegments
+            .dropLast(1)
+            .lastOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?.let(Uri::decode)
+        return streamName?.let { "$host • $it" } ?: host
+    }
+
     private fun openInput(uri: Uri): InputStream =
         if (uri.scheme.equals("https", ignoreCase = true)) {
             HttpsStreams.open(uri.toString())
@@ -1070,8 +1194,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         header: EcdcHeader,
         startSample: Long,
     ): PreparedRemoteInput {
-        val stride = requireNotNull(header.variant.segmentStrideSamples)
-        val frameIndex = (startSample / stride).toInt()
+        val frameIndex = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            (startSample / EcdcReader.MONO_CHUNK_SAMPLES).toInt()
+        } else {
+            val stride = requireNotNull(header.variant.segmentStrideSamples)
+            (startSample / stride).toInt()
+        }
         if (frameIndex == 0) return PreparedRemoteInput(openInput(uri), 0)
 
         // Android document providers commonly expose a seekable descriptor. Use
@@ -1079,7 +1207,18 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         // virtual providers can expose a pipe instead, so retain the old reader
         // walk as a compatibility fallback.
         val headerBytes = openInput(uri).use(EcdcReader::readHeaderBytes)
-        val rangeStart = EcdcReader.frameByteOffset(header, headerBytes.size, frameIndex)
+        val initialFrameIndex = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            // Decode one preceding four-second chunk so EcdcReader can retain
+            // the final causal second as decoder warm-up for the target chunk.
+            (frameIndex - 1).coerceAtLeast(0)
+        } else {
+            frameIndex
+        }
+        val rangeStart = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            EcdcReader.monoChunkByteOffset(header, headerBytes.size, initialFrameIndex)
+        } else {
+            EcdcReader.frameByteOffset(header, headerBytes.size, initialFrameIndex)
+        }
         val descriptor = getApplication<Application>().contentResolver
             .openAssetFileDescriptor(uri, "r")
             ?: return PreparedRemoteInput(openInput(uri), 0)
@@ -1091,7 +1230,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     ByteArrayInputStream(headerBytes),
                     DescriptorInputStream(positioned, descriptor),
                 ),
-                frameIndex,
+                initialFrameIndex,
             )
         } catch (_: Throwable) {
             runCatching { descriptor.close() }
@@ -1115,9 +1254,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val headerSize = 9 + metadataSize
         require(headerSize in 9..prefix.size) { "Remote ECDC metadata exceeds 1 KiB" }
         val exactHeader = prefix.copyOf(headerSize)
-        val stride = requireNotNull(header.variant.segmentStrideSamples)
-        val frameIndex = (startSample / stride).toInt()
-        val rangeStart = EcdcReader.frameByteOffset(header, headerSize, frameIndex)
+        val frameIndex = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            (startSample / EcdcReader.MONO_CHUNK_SAMPLES).toInt()
+        } else {
+            val stride = requireNotNull(header.variant.segmentStrideSamples)
+            (startSample / stride).toInt()
+        }
+        val initialFrameIndex = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            (frameIndex - 1).coerceAtLeast(0)
+        } else {
+            frameIndex
+        }
+        val rangeStart = if (header.variant == EncodecVariant.MONO_24_KHZ) {
+            EcdcReader.monoChunkByteOffset(header, headerSize, initialFrameIndex)
+        } else {
+            EcdcReader.frameByteOffset(header, headerSize, initialFrameIndex)
+        }
         val startupBytes = (header.nominalBitrateBps * STATIC_STARTUP_SECONDS / 8)
             .coerceIn(STATIC_MIN_STARTUP_BYTES, STATIC_MAX_STARTUP_BYTES) + headerSize
         val input = DownloadAheadInputStream.open(
@@ -1130,7 +1282,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 )
             },
         )
-        return PreparedRemoteInput(input, frameIndex)
+        return PreparedRemoteInput(input, initialFrameIndex)
     }
 
     private data class PreparedRemoteInput(
@@ -1155,48 +1307,63 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         require(!header.usesLanguageModel) {
             "LM-coded files are not supported yet"
         }
-        require(header.variant == EncodecVariant.STEREO_48_KHZ) {
-            "24 kHz non-HQ files are not supported"
+        val maximumCodebooks = when (header.variant) {
+            EncodecVariant.MONO_24_KHZ -> 32
+            EncodecVariant.STEREO_48_KHZ -> 16
+        }
+        require(header.numCodebooks <= maximumCodebooks) {
+            "${header.numCodebooks} codebooks exceed the ${header.variant.wireName} model capacity"
         }
     }
 
     private fun decoderConfig(variant: EncodecVariant): DecoderConfig = when (variant) {
         EncodecVariant.STEREO_48_KHZ -> DecoderConfig(
-            assetName = "encodec_48khz_decoder.pte",
-            maxCodebooks = 16,
-            timeSteps = 150,
+            assetName = "encodec-decoder-48khz-f32.bin",
         )
-        EncodecVariant.MONO_24_KHZ -> error("24 kHz non-HQ files are not supported")
+        EncodecVariant.MONO_24_KHZ -> DecoderConfig(
+            assetName = "encodec-decoder-24khz-f32.bin",
+        )
     }
 
     private data class DecoderConfig(
         val assetName: String,
-        val maxCodebooks: Int,
-        val timeSteps: Int,
     )
 
-    /** Decoder initialization is expensive; one instance can serve all HQ sessions serially. */
+    /** Keep only one native model resident; variant changes trade a reload for much lower RAM use. */
     private fun decoderFor(
         config: DecoderConfig,
         variant: EncodecVariant,
-    ): ExecuTorchEncodecDecoder = cachedDecoder ?: ExecuTorchEncodecDecoder(
-        copyAssetOnce(config.assetName),
-        variant,
-        maxCodebooks = config.maxCodebooks,
-        modelTimeSteps = config.timeSteps,
-    ).also { cachedDecoder = it }
+    ): EncodecDecoder {
+        cachedDecoder?.takeIf { it.variant == variant }?.let { return it }
+        cachedDecoder?.close()
+        cachedDecoder = null
+        return CppEncodecDecoder(
+            copyAssetOnce(config.assetName),
+            variant,
+            rescale = true,
+        ).also { cachedDecoder = it }
+    }
 
-    private fun audioSink(): AudioTrackSink = cachedAudioSink ?: AudioTrackSink(
-        EncodecVariant.STEREO_48_KHZ.sampleRate,
-        EncodecVariant.STEREO_48_KHZ.channels,
-    ).also { cachedAudioSink = it }
+    private fun audioSink(variant: EncodecVariant): AudioTrackSink {
+        cachedAudioSink?.takeIf {
+            it.sampleRate == variant.sampleRate && it.channels == variant.channels
+        }?.let { return it }
+        cachedAudioSink?.close()
+        cachedAudioSink = null
+        return AudioTrackSink(variant.sampleRate, variant.channels).also { cachedAudioSink = it }
+    }
 
     private fun copyAssetOnce(name: String): File {
         val filesDir = getApplication<Application>().filesDir
         val destination = File(filesDir, name)
         if (!destination.exists()) {
+            val temporary = File(filesDir, "$name.tmp")
+            temporary.delete()
             getApplication<Application>().assets.open(name).use { source ->
-                destination.outputStream().use(source::copyTo)
+                temporary.outputStream().use(source::copyTo)
+            }
+            check(temporary.renameTo(destination)) {
+                "Could not install decoder model $name"
             }
         }
         return destination
@@ -1204,6 +1371,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun removeObsoleteDecoderModels() {
         val filesDir = getApplication<Application>().filesDir
+        File(filesDir, "encodec_48khz_decoder.pte").delete()
         File(filesDir, "encodec_24khz_decoder.pte").delete()
         File(filesDir, "encodec_24khz_decoder_308.pte").delete()
     }

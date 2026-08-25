@@ -1,5 +1,6 @@
 package com.henry.encodec.player
 
+import com.henry.encodec.ecdc.EncodecVariant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -27,10 +28,28 @@ class LiveManifestTest {
     }
 
     @Test
-    fun startsTwoSegmentsBehindLiveEdge() {
+    fun parses24KhzMonoManifest() {
+        val parsed = LiveManifestParser.parse(
+            manifestJson(listOf(segment(10)), mediaSequence = 10)
+                .replace("\"model\":\"encodec_48khz\"", "\"model\":\"encodec_24khz\"")
+                .replace("\"sample_rate\":48000", "\"sample_rate\":24000")
+                .replace("\"channels\":2", "\"channels\":1")
+                .replace("\"bandwidth_kbps\":12.0", "\"bandwidth_kbps\":6.0")
+                .replace("\"sample_count\":96000", "\"sample_count\":48000")
+                .replace("\"pts_samples\":960000", "\"pts_samples\":480000"),
+            MANIFEST_URL,
+        )
+
+        assertEquals(EncodecVariant.MONO_24_KHZ, parsed.init.variant)
+        assertEquals(6.0, parsed.init.bandwidthKbps, 0.0)
+        assertEquals(48_000, parsed.segments.single().sampleCount)
+    }
+
+    @Test
+    fun startsWithThreeSafeSegmentsAvailableBeforeLiveEdge() {
         val tracker = LiveSequenceTracker()
         val manifest = manifest((10L..15L).map(::info))
-        assertEquals(13L, tracker.select(manifest)?.sequence)
+        assertEquals(11L, tracker.select(manifest)?.sequence)
     }
 
     @Test
@@ -43,13 +62,17 @@ class LiveManifestTest {
     }
 
     @Test
-    fun progressesInSequenceWithoutDuplicates() {
+    fun progressesInSequenceWhileKeepingTwoSegmentLiveEdgeMargin() {
         val tracker = LiveSequenceTracker()
-        val firstManifest = manifest(listOf(info(30), info(31), info(32)))
+        val firstManifest = manifest((30L..34L).map(::info))
         assertEquals(30, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertEquals(31, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertEquals(32, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertNull(tracker.select(firstManifest))
+
+        val updatedManifest = manifest((30L..35L).map(::info))
+        assertEquals(33, tracker.accept(requireNotNull(tracker.select(updatedManifest))).segment.sequence)
+        assertNull(tracker.select(updatedManifest))
     }
 
     @Test
@@ -58,7 +81,7 @@ class LiveManifestTest {
         tracker.accept(info(40))
         val overtaken = manifest((50L..55L).map(::info))
         val selected = requireNotNull(tracker.select(overtaken))
-        assertEquals(53, selected.sequence)
+        assertEquals(51, selected.sequence)
         assertTrue(tracker.accept(selected).discontinuity)
     }
 
@@ -113,7 +136,7 @@ class LiveManifestTest {
             sha256 = bytes.sha256(),
             sampleCount = 96_000,
         )
-        val init = LiveCodecInit("encodec_48khz", 48_000, 2, 12.0, 8)
+        val init = LiveCodecInit(EncodecVariant.STEREO_48_KHZ, 12.0, 8)
         LiveStreamSource.verifySegment(bytes, valid, init)
         assertThrows(LiveProtocolException::class.java) {
             LiveStreamSource.verifySegment(bytes, valid.copy(byteLength = bytes.size + 1), init)
@@ -124,12 +147,26 @@ class LiveManifestTest {
     }
 
     @Test
+    fun verifies24KhzMonoSegmentInitialization() {
+        val bytes = ecdcHeader(48_000, 8, "encodec_24khz")
+        val segment = info(
+            sequence = 71,
+            byteLength = bytes.size,
+            sha256 = bytes.sha256(),
+            sampleCount = 48_000,
+        )
+        val init = LiveCodecInit(EncodecVariant.MONO_24_KHZ, 6.0, 8)
+
+        LiveStreamSource.verifySegment(bytes, segment, init)
+    }
+
+    @Test
     fun resetReconnectsAtLiveEdgeAndSourceIsCancellable() = runBlocking {
         val tracker = LiveSequenceTracker()
         val manifest = manifest((80L..85L).map(::info))
         tracker.accept(requireNotNull(tracker.select(manifest)))
         tracker.reset()
-        assertEquals(83L, tracker.select(manifest)?.sequence)
+        assertEquals(81L, tracker.select(manifest)?.sequence)
 
         val source = LiveStreamSource(
             MANIFEST_URL,
@@ -150,7 +187,7 @@ class LiveManifestTest {
     }
 
     @Test
-    fun cachedManifestSuppliesFollowingSegmentsWithoutAnotherPoll() = runBlocking {
+    fun sourceRefreshesBeforeEnteringProtectedLiveEdge() = runBlocking {
         val bytes = ecdcHeader(96_000, 8)
         val hash = bytes.sha256()
         var manifestFetches = 0
@@ -159,22 +196,23 @@ class LiveManifestTest {
             fetchManifestBytes = {
                 manifestFetches++
                 manifestJson(
-                    (1L..3L).map { segment(it, bytes.size, hash) },
+                    (1L..(manifestFetches + 2L)).map { segment(it, bytes.size, hash) },
                 ).toByteArray()
             },
             fetchSegmentBytes = { bytes },
         )
 
+        assertEquals(EncodecVariant.STEREO_48_KHZ, source.initialize {}.variant)
         assertEquals(1L, source.nextSegment {}.sequence)
         assertEquals(2L, source.nextSegment {}.sequence)
-        assertEquals(1, manifestFetches)
+        assertEquals(2, manifestFetches)
     }
 
     private fun manifest(segments: List<LiveSegmentInfo>) = LiveManifest(
         mediaSequence = segments.firstOrNull()?.sequence ?: 0,
         discontinuitySequence = 0,
         targetDuration = 2.0,
-        init = LiveCodecInit("encodec_48khz", 48_000, 2, 12.0, 8),
+        init = LiveCodecInit(EncodecVariant.STEREO_48_KHZ, 12.0, 8),
         segments = segments,
     )
 
@@ -214,8 +252,12 @@ class LiveManifestTest {
          "discontinuity":false,"byte_length":$byteLength,"sha256":"$sha256"}
     """.trimIndent()
 
-    private fun ecdcHeader(samples: Long, codebooks: Int): ByteArray {
-        val metadata = "{\"m\":\"encodec_48khz\",\"al\":$samples,\"nc\":$codebooks,\"lm\":false}"
+    private fun ecdcHeader(
+        samples: Long,
+        codebooks: Int,
+        model: String = "encodec_48khz",
+    ): ByteArray {
+        val metadata = "{\"m\":\"$model\",\"al\":$samples,\"nc\":$codebooks,\"lm\":false}"
         return ByteArrayOutputStream().also { bytes ->
             DataOutputStream(bytes).use { out ->
                 out.writeBytes("ECDC")

@@ -54,20 +54,34 @@ class LiveEcdcPlaybackSession(
         try {
             currentSink = sink
             try {
+                // Decode only the first EnCodec frame before starting the
+                // device. This gives AudioTrack about one second of immediate
+                // PCM without delaying startup for a complete live segment.
+                val initialSegment = nextSegment()
                 sink.flushQueued()
-                sink.start()
-                if (paused) sink.pause()
-                var first = true
+                var started = false
+                initialSegment.input.use { input ->
+                    decode(input) { pcm ->
+                        if (stopRequested) return@decode false
+                        if (!started) {
+                            sink.start()
+                            if (paused) sink.pause()
+                            started = true
+                        }
+                        write(sink, pcm)
+                    }
+                }
+                if (!started || stopRequested) return@withContext
+                if (!stopRequested) onSegmentPlaying(initialSegment.sequence)
                 while (!stopRequested) {
                     coroutineContext.ensureActive()
                     val segment = nextSegment()
-                    if (!first && segment.discontinuity) {
+                    if (segment.discontinuity) {
                         sink.flushQueued()
                         if (!paused) sink.resume()
                     }
                     segment.input.use { decodeAndWrite(it, sink) }
                     if (!stopRequested) onSegmentPlaying(segment.sequence)
-                    first = false
                 }
             } finally {
                 currentSink = null
@@ -78,6 +92,10 @@ class LiveEcdcPlaybackSession(
     }
 
     private fun decodeAndWrite(input: InputStream, sink: AudioTrackSink) {
+        decode(input) { write(sink, it) }
+    }
+
+    private fun decode(input: InputStream, emit: (DecodedPcm) -> Boolean) {
         EcdcReader(input).use { reader ->
             require(reader.header.variant == decoder.variant) {
                 "Live segment uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
@@ -93,22 +111,22 @@ class LiveEcdcPlaybackSession(
                 val frame = reader.readFrame() ?: break
                 val pcm = decoder.decode(frame)
                 if (overlapSamples == 0) {
-                    if (!write(sink, pcm)) return
+                    if (!emit(pcm)) return
                     emittedSamples += pcm.frameCount
                     continue
                 }
                 val previousTail = pendingTail
                 if (previousTail == null) {
                     val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(0)
-                    if (bodyEnd > 0 && !write(sink, pcm.sliceFrames(0, bodyEnd))) return
+                    if (bodyEnd > 0 && !emit(pcm.sliceFrames(0, bodyEnd))) return
                     emittedSamples += bodyEnd
                     pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 } else {
                     val overlap = minOf(overlapSamples, previousTail.frameCount, pcm.frameCount)
-                    if (overlap > 0 && !write(sink, crossfade(previousTail, pcm, overlap))) return
+                    if (overlap > 0 && !emit(crossfade(previousTail, pcm, overlap))) return
                     emittedSamples += overlap
                     val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(overlap)
-                    if (bodyEnd > overlap && !write(sink, pcm.sliceFrames(overlap, bodyEnd))) return
+                    if (bodyEnd > overlap && !emit(pcm.sliceFrames(overlap, bodyEnd))) return
                     emittedSamples += bodyEnd - overlap
                     pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 }
@@ -116,7 +134,7 @@ class LiveEcdcPlaybackSession(
             pendingTail?.let { last ->
                 val remaining = (reader.header.audioLengthSamples - emittedSamples)
                     .coerceAtMost(last.frameCount.toLong()).toInt()
-                if (!stopRequested && remaining > 0) write(sink, last.sliceFrames(0, remaining))
+                if (!stopRequested && remaining > 0) emit(last.sliceFrames(0, remaining))
             }
         }
     }

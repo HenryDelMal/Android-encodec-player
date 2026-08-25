@@ -57,7 +57,7 @@ class EcdcPlaybackSession(
                     if (paused) sink.pause()
                     val requestedStart = startSample.coerceIn(0, reader.header.audioLengthSamples - 1)
                     val stride = reader.header.variant.segmentStrideSamples
-                        ?: reader.header.audioLengthSamples.toInt()
+                        ?: EcdcReader.MONO_CHUNK_SAMPLES
                     val targetFrameIndex = (requestedStart / stride).toInt()
                     require(initialFrameIndex <= targetFrameIndex)
                     repeat(targetFrameIndex - initialFrameIndex) {
@@ -65,8 +65,11 @@ class EcdcPlaybackSession(
                         reader.readFrame() ?: return@withContext
                     }
 
+                    // Two UI position updates per second are smooth enough for
+                    // the seek bar and avoid recomposing the complete player at
+                    // the former 10 Hz rate while native decoding is active.
                     val progressIntervalSamples =
-                        (reader.header.variant.sampleRate / 10).coerceAtLeast(1).toLong()
+                        (reader.header.variant.sampleRate / 2).coerceAtLeast(1).toLong()
                     var lastReportedSample = requestedStart - progressIntervalSamples
                     fun reportPlayedPosition(force: Boolean = false) {
                         val playedSample = (requestedStart + sink.playedFrames())

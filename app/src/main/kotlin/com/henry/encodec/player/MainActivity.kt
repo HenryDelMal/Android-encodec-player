@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -40,6 +41,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -49,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.painterResource
 import com.henry.encodec.ecdc.EcdcHeader
+import com.henry.encodec.ecdc.EncodecVariant
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -101,6 +104,7 @@ private fun PlayerScreen(model: PlayerViewModel) {
     var draggingSlider by remember { mutableStateOf(false) }
     var showUrlDialog by remember { mutableStateOf(false) }
     var urlText by remember { mutableStateOf(model.lastLiveUrl()) }
+    var showLivestreams by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(state.progress) {
         if (!draggingSlider) sliderPosition = state.progress
     }
@@ -127,15 +131,6 @@ private fun PlayerScreen(model: PlayerViewModel) {
                 enabled = !state.addingUrl,
                 onClick = { showUrlDialog = true },
             ) { Text(if (state.addingUrl) "Checking…" else "Open URL") }
-            IconButton(
-                enabled = state.playlist.isNotEmpty(),
-                onClick = model::clearPlaylist,
-            ) {
-                Icon(
-                    painterResource(android.R.drawable.ic_menu_delete),
-                    contentDescription = "Delete all playlist items",
-                )
-            }
         }
 
         NowPlaying(state)
@@ -256,53 +251,147 @@ private fun PlayerScreen(model: PlayerViewModel) {
             }
         }
 
-        Text(
-            "Playlist (${state.playlist.size})",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (showLivestreams) {
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = { showLivestreams = false },
+                ) { Text("Tracks (${state.playlist.size})") }
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = { showLivestreams = true },
+                ) { Text("Livestreams (${state.livestreams.size})") }
+            } else {
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = { showLivestreams = false },
+                ) { Text("Tracks (${state.playlist.size})") }
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = { showLivestreams = true },
+                ) { Text("Livestreams (${state.livestreams.size})") }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (showLivestreams) "Saved livestreams" else "Playlist",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            IconButton(
+                enabled = if (showLivestreams) {
+                    state.livestreams.isNotEmpty()
+                } else {
+                    state.playlist.isNotEmpty()
+                },
+                onClick = if (showLivestreams) model::clearLiveStreams else model::clearPlaylist,
+            ) {
+                Icon(
+                    painterResource(android.R.drawable.ic_menu_delete),
+                    contentDescription = if (showLivestreams) {
+                        "Delete all saved livestreams"
+                    } else {
+                        "Delete all playlist items"
+                    },
+                )
+            }
+        }
         LazyColumn(
             modifier = Modifier.weight(1f).fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            itemsIndexed(state.playlist, key = { _, item -> item.uri.toString() }) { index, item ->
-                val selected = state.live == null && index == state.currentIndex
-                Card(
-                    modifier = Modifier.fillMaxWidth().clickable { model.selectTrack(index) },
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (selected) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
+            if (showLivestreams) {
+                itemsIndexed(
+                    state.livestreams,
+                    key = { _, item -> item.manifestUrl },
+                ) { index, item ->
+                    val selected = state.live?.manifestUrl == item.manifestUrl
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            model.openLive(item.manifestUrl)
                         },
-                    ),
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (selected) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                        ),
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "${index + 1}. ${item.title}",
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = buildString {
-                                    if (item.uri.scheme.equals("https", ignoreCase = true)) append("HTTPS stream • ")
-                                    append("${formatBitrate(item.header)} • ")
-                                    append("${item.header.numCodebooks} codebooks • ")
-                                    append("48 kHz stereo")
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    item.title,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    item.manifestUrl,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(onClick = { model.removeLiveStream(index) }) {
+                                Icon(
+                                    painterResource(android.R.drawable.ic_menu_delete),
+                                    contentDescription = "Remove ${item.title}",
+                                )
+                            }
                         }
-                        IconButton(onClick = { model.removeTrack(index) }) {
-                            Icon(
-                                painterResource(android.R.drawable.ic_menu_delete),
-                                contentDescription = "Remove ${item.title}",
-                            )
+                    }
+                }
+            } else {
+                itemsIndexed(state.playlist, key = { _, item -> item.uri.toString() }) { index, item ->
+                    val selected = state.live == null && index == state.currentIndex
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { model.selectTrack(index) },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (selected) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                        ),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "${index + 1}. ${item.title}",
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = buildString {
+                                        if (item.uri.scheme.equals("https", ignoreCase = true)) append("HTTPS file • ")
+                                        append("${formatBitrate(item.header)} • ")
+                                        append("${item.header.numCodebooks} codebooks • ")
+                                        append(formatAudioFormat(item.header))
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            IconButton(onClick = { model.removeTrack(index) }) {
+                                Icon(
+                                    painterResource(android.R.drawable.ic_menu_delete),
+                                    contentDescription = "Remove ${item.title}",
+                                )
+                            }
                         }
                     }
                 }
@@ -318,7 +407,7 @@ private fun PlayerScreen(model: PlayerViewModel) {
             title = { Text("Open URL") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Enter a finite HTTPS .ecdc URL or an HTTP(S) EnCodec live manifest URL.")
+                    Text("Enter a .ecdc file URL or an EnCodec Live .json manifest URL.")
                     OutlinedTextField(
                         value = urlText,
                         onValueChange = { urlText = it },
@@ -331,24 +420,15 @@ private fun PlayerScreen(model: PlayerViewModel) {
                 }
             },
             confirmButton = {
-                Row {
-                    TextButton(
-                        enabled = urlText.trim().startsWith("https://", ignoreCase = true),
-                        onClick = {
-                            model.addUrl(urlText)
-                            showUrlDialog = false
-                        },
-                    ) { Text("Add file") }
-                    TextButton(
-                        enabled = urlText.trim().let {
-                            it.startsWith("http://", true) || it.startsWith("https://", true)
-                        },
-                        onClick = {
-                            model.openLive(urlText)
-                            showUrlDialog = false
-                        },
-                    ) { Text("Open livestream") }
-                }
+                TextButton(
+                    enabled = urlText.trim().let {
+                        it.startsWith("http://", true) || it.startsWith("https://", true)
+                    },
+                    onClick = {
+                        model.openUrl(urlText)
+                        showUrlDialog = false
+                    },
+                ) { Text("Open") }
             },
             dismissButton = {
                 TextButton(onClick = { showUrlDialog = false }) { Text("Cancel") }
@@ -392,8 +472,8 @@ private fun NowPlaying(state: PlayerState) {
             val details = buildList {
                 live.bandwidthKbps?.let { add("${formatNumber(it)} kbps") }
                 live.codebooks?.let { add("$it codebooks") }
-                add("${live.bufferedSegments}/${live.targetBufferedSegments} buffered")
-                add("48 kHz stereo")
+                add("${live.bufferedSegments}/${live.targetBufferedSegments} downloaded")
+                live.variant?.let { add(formatAudioFormat(it)) }
             }
             Text(details.joinToString(" • "), style = MaterialTheme.typography.bodySmall)
         } else if (item != null) {
@@ -402,7 +482,8 @@ private fun NowPlaying(state: PlayerState) {
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                "${formatBitrate(item.header)} • ${item.header.numCodebooks} codebooks • 48 kHz stereo",
+                "${formatBitrate(item.header)} • ${item.header.numCodebooks} codebooks • " +
+                    formatAudioFormat(item.header),
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -421,4 +502,17 @@ private fun formatBitrate(header: EcdcHeader): String {
         String.format(Locale.US, "%.2f", kbps).trimEnd('0').trimEnd('.')
     }
     return "$number kbps"
+}
+
+private fun formatAudioFormat(header: EcdcHeader): String = formatAudioFormat(header.variant)
+
+private fun formatAudioFormat(variant: EncodecVariant): String {
+    val sampleRateKhz = variant.sampleRate / 1_000.0
+    val sampleRate = if (sampleRateKhz % 1.0 == 0.0) {
+        sampleRateKhz.toInt().toString()
+    } else {
+        formatNumber(sampleRateKhz)
+    }
+    val channelLayout = if (variant.channels == 1) "mono" else "stereo"
+    return "$sampleRate kHz $channelLayout"
 }

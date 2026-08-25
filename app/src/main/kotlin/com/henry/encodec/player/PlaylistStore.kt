@@ -25,7 +25,7 @@ class PlaylistStore(context: Context) {
                     numCodebooks = item.getInt("numCodebooks"),
                     usesLanguageModel = item.getBoolean("usesLanguageModel"),
                 )
-                if (variant == EncodecVariant.STEREO_48_KHZ && !header.usesLanguageModel) {
+                if (!header.usesLanguageModel) {
                     add(
                         PlaylistItem(
                             uri = Uri.parse(item.getString("uri")),
@@ -40,8 +40,24 @@ class PlaylistStore(context: Context) {
         val repeatMode = runCatching {
             RepeatMode.valueOf(root.optString("repeatMode", RepeatMode.OFF.name))
         }.getOrDefault(RepeatMode.OFF)
+        val livestreamsJson = root.optJSONArray("livestreams") ?: JSONArray()
+        val livestreams = buildList<SavedLiveStream> {
+            for (index in 0 until livestreamsJson.length()) {
+                val item = livestreamsJson.getJSONObject(index)
+                val manifestUrl = item.optString("manifestUrl").trim()
+                if (manifestUrl.isNotEmpty() && none { it.manifestUrl == manifestUrl }) {
+                    add(
+                        SavedLiveStream(
+                            manifestUrl = manifestUrl,
+                            title = item.optString("title", manifestUrl),
+                        ),
+                    )
+                }
+            }
+        }
         PlayerState(
             playlist = items,
+            livestreams = livestreams,
             currentIndex = if (items.isEmpty()) -1 else storedIndex.coerceIn(items.indices),
             shuffle = root.optBoolean("shuffle", false),
             repeatMode = repeatMode,
@@ -62,8 +78,17 @@ class PlaylistStore(context: Context) {
                     .put("usesLanguageModel", playlistItem.header.usesLanguageModel),
             )
         }
+        val livestreams = JSONArray()
+        state.livestreams.forEach { stream ->
+            livestreams.put(
+                JSONObject()
+                    .put("manifestUrl", stream.manifestUrl)
+                    .put("title", stream.title),
+            )
+        }
         val root = JSONObject()
             .put("items", items)
+            .put("livestreams", livestreams)
             .put("currentIndex", state.currentIndex)
             .put("shuffle", state.shuffle)
             .put("repeatMode", state.repeatMode.name)

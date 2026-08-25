@@ -17,9 +17,7 @@ import kotlin.math.abs
 import kotlin.math.min
 
 data class LiveCodecInit(
-    val model: String,
-    val sampleRate: Int,
-    val channels: Int,
+    val variant: EncodecVariant,
     val bandwidthKbps: Double,
     val codebooks: Int,
 )
@@ -76,17 +74,26 @@ object LiveManifestParser {
         val initJson = root.getJSONObject("init")
         protocol(initJson.getString("container") == "ecdc") { "Live container is not ECDC" }
         protocol(initJson.getInt("container_version") == 0) { "Unsupported ECDC container version" }
-        protocol(initJson.getString("model") == "encodec_48khz") { "Only HQ EnCodec live streams are supported" }
-        protocol(initJson.getInt("sample_rate") == 48_000) { "Live stream is not 48 kHz" }
-        protocol(initJson.getInt("channels") == 2) { "Live stream is not stereo" }
+        val model = initJson.getString("model")
+        val variant = EncodecVariant.entries.firstOrNull { it.wireName == model }
+            ?: throw LiveProtocolException("Unsupported EnCodec live model: $model")
+        protocol(initJson.getInt("sample_rate") == variant.sampleRate) {
+            "Live sample rate does not match $model"
+        }
+        protocol(initJson.getInt("channels") == variant.channels) {
+            "Live channel count does not match $model"
+        }
         protocol(initJson.getInt("bits_per_codebook") == 10) { "Unsupported code width" }
         protocol(!initJson.getBoolean("language_model")) { "LM-coded live streams are not supported" }
         protocol(initJson.getBoolean("self_initializing_segments")) { "Segments lack initialization" }
         val codebooks = initJson.getInt("codebooks")
-        protocol(codebooks in SUPPORTED_CODEBOOKS) { "Unsupported live codebook count" }
+        protocol(codebooks in supportedCodebooks(variant)) { "Unsupported live codebook count" }
         val bandwidth = initJson.getDouble("bandwidth_kbps")
-        protocol(abs(bandwidth - codebooks * 1.5) < 0.001) { "Bandwidth and codebooks do not match" }
-        val init = LiveCodecInit("encodec_48khz", 48_000, 2, bandwidth, codebooks)
+        val codebookBitrateKbps = variant.frameRate * 10.0 / 1_000.0
+        protocol(abs(bandwidth - codebooks * codebookBitrateKbps) < 0.001) {
+            "Bandwidth and codebooks do not match"
+        }
+        val init = LiveCodecInit(variant, bandwidth, codebooks)
 
         val array = root.getJSONArray("segments")
         val segments = buildList {
@@ -99,7 +106,7 @@ object LiveManifestParser {
                 val duration = item.getDouble("duration")
                 val sampleCount = item.getLong("sample_count")
                 protocol(duration.isFinite() && duration > 0.0 && sampleCount > 0) { "Invalid live segment duration" }
-                protocol(abs(duration - sampleCount.toDouble() / 48_000.0) <= 0.02) {
+                protocol(abs(duration - sampleCount.toDouble() / variant.sampleRate) <= 0.02) {
                     "Segment duration and sample count disagree"
                 }
                 val ptsSamples = item.getLong("pts_samples")
@@ -141,7 +148,10 @@ object LiveManifestParser {
 
     internal const val MAX_SEGMENT_BYTES = 8 * 1024 * 1024
     internal const val MAX_MANIFEST_BYTES = 1024 * 1024
-    private val SUPPORTED_CODEBOOKS = setOf(2, 4, 8, 16)
+    internal fun supportedCodebooks(variant: EncodecVariant): Set<Int> = when (variant) {
+        EncodecVariant.MONO_24_KHZ -> setOf(2, 4, 8, 16, 32)
+        EncodecVariant.STEREO_48_KHZ -> setOf(2, 4, 8, 16)
+    }
     private val SHA256_REGEX = Regex("[0-9a-f]{64}")
 }
 
@@ -151,11 +161,22 @@ class LiveSequenceTracker {
 
     fun select(manifest: LiveManifest): LiveSegmentInfo? {
         if (manifest.segments.isEmpty()) return null
+        val safeEdgeIndex = (manifest.segments.lastIndex - LIVE_EDGE_OFFSET).coerceAtLeast(0)
+        val safeEdge = manifest.segments[safeEdgeIndex]
         val expected = nextSequence
         if (expected == null || expected < manifest.segments.first().sequence) {
-            return manifest.segments[(manifest.segments.lastIndex - LIVE_EDGE_OFFSET).coerceAtLeast(0)]
+            // Begin far enough behind the protected live edge to download the
+            // complete startup cushion from the current manifest immediately.
+            val startupIndex = (safeEdgeIndex - (STARTUP_BUFFER_SEGMENTS - 1))
+                .coerceAtLeast(0)
+            return manifest.segments[startupIndex]
         }
-        return manifest.segments.firstOrNull { it.sequence >= expected }
+        // Do not consume the newest published entries. A fast downloader used
+        // to race through the cached manifest and then wait directly at its
+        // live edge, leaving no publication-time cushion for AudioTrack.
+        return manifest.segments
+            .take(safeEdgeIndex + 1)
+            .firstOrNull { it.sequence >= expected }
     }
 
     fun accept(segment: LiveSegmentInfo): LiveSelection {
@@ -177,6 +198,7 @@ class LiveSequenceTracker {
 
     private companion object {
         const val LIVE_EDGE_OFFSET = 2
+        const val STARTUP_BUFFER_SEGMENTS = 3
     }
 }
 
@@ -194,6 +216,27 @@ class LiveStreamSource(
     private var cachedManifest: LiveManifest? = null
     private var streamInit: LiveCodecInit? = null
 
+    suspend fun initialize(onStatus: (String) -> Unit): LiveCodecInit {
+        streamInit?.let { return it }
+        while (currentCoroutineContext().isActive) {
+            try {
+                onStatus(if (retryCount == 0) "Checking stream format…" else "Reconnecting…")
+                val manifest = fetchAndCacheManifest()
+                retryCount = 0
+                return manifest.init
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (protocol: LiveProtocolException) {
+                throw protocol
+            } catch (error: IOException) {
+                retryCount++
+                onStatus("Network error: ${error.message ?: "retrying"}")
+                delay(min(5_000L, 500L * retryCount))
+            }
+        }
+        throw CancellationException("Live stream stopped")
+    }
+
     suspend fun nextSegment(onStatus: (String) -> Unit): DownloadedLiveSegment {
         while (currentCoroutineContext().isActive) {
             try {
@@ -201,16 +244,7 @@ class LiveStreamSource(
                 var selected = manifest?.let(tracker::select)
                 if (selected == null) {
                     onStatus(if (retryCount == 0) "Checking live edge…" else "Reconnecting…")
-                    manifest = LiveManifestParser.parse(
-                        fetchManifestBytes().toString(Charsets.UTF_8),
-                        manifestUrl,
-                    )
-                    val expectedInit = streamInit
-                    if (expectedInit != null && manifest.init != expectedInit) {
-                        throw LiveProtocolException("Live codec initialization changed")
-                    }
-                    streamInit = manifest.init
-                    cachedManifest = manifest
+                    manifest = fetchAndCacheManifest()
                     selected = tracker.select(manifest)
                 }
                 val activeManifest = manifest
@@ -250,7 +284,21 @@ class LiveStreamSource(
     }
 
     private fun pollDelayMillis(manifest: LiveManifest): Long =
-        (manifest.targetDuration * 500).toLong().coerceIn(250L, 5_000L)
+        (manifest.targetDuration * 250).toLong().coerceIn(250L, 1_000L)
+
+    private suspend fun fetchAndCacheManifest(): LiveManifest {
+        val manifest = LiveManifestParser.parse(
+            fetchManifestBytes().toString(Charsets.UTF_8),
+            manifestUrl,
+        )
+        val expectedInit = streamInit
+        if (expectedInit != null && manifest.init != expectedInit) {
+            throw LiveProtocolException("Live codec initialization changed")
+        }
+        streamInit = manifest.init
+        cachedManifest = manifest
+        return manifest
+    }
 
     companion object {
         fun verifySegment(bytes: ByteArray, segment: LiveSegmentInfo, init: LiveCodecInit) {
@@ -269,9 +317,9 @@ class LiveStreamSource(
             } catch (error: Exception) {
                 throw LiveProtocolException("Segment ${segment.sequence} is not valid ECDC v0", error)
             }
-            if (header.version != 0 || header.variant != EncodecVariant.STEREO_48_KHZ ||
+            if (header.version != 0 || header.variant != init.variant ||
                 header.usesLanguageModel || header.numCodebooks != init.codebooks ||
-                header.numCodebooks !in setOf(2, 4, 8, 16) ||
+                header.numCodebooks !in LiveManifestParser.supportedCodebooks(init.variant) ||
                 header.audioLengthSamples != segment.sampleCount
             ) {
                 throw LiveProtocolException("Segment ${segment.sequence} codec initialization changed")

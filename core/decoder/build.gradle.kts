@@ -30,5 +30,4 @@ kotlin { jvmToolchain(17) }
 
 dependencies {
     api(project(":core:ecdc"))
-    implementation("org.pytorch:executorch-android:1.0.0")
 }
