@@ -23,8 +23,22 @@ class LiveManifestTest {
             MANIFEST_URL,
         )
         assertEquals(8, parsed.init.codebooks)
+        assertNull(parsed.title)
         assertEquals("https://example.com/live/segment-10.ecdc", parsed.segments.single().url)
         assertEquals(96_000, parsed.segments.single().sampleCount)
+    }
+
+    @Test
+    fun parsesOptionalStreamTitle() {
+        val document = manifestJson(listOf(segment(10)), mediaSequence = 10)
+            .replace(
+                "\"format\":\"encodec-live-v1\"",
+                "\"format\":\"encodec-live-v1\",\"title\":\"Radio Bio Bio Santiago\"",
+            )
+
+        val parsed = LiveManifestParser.parse(document, MANIFEST_URL)
+
+        assertEquals("Radio Bio Bio Santiago", parsed.title)
     }
 
     @Test
@@ -119,6 +133,10 @@ class LiveManifestTest {
             valid.replace("\"codebooks\":8", "\"codebooks\":3"),
             valid.replace("\"duration\":2.0", "\"duration\":0.0"),
             valid.replace("\"sha256\":\"${"a".repeat(64)}\"", "\"sha256\":\"bad\""),
+            valid.replace(
+                "\"format\":\"encodec-live-v1\"",
+                "\"format\":\"encodec-live-v1\",\"title\":\"${"x".repeat(201)}\"",
+            ),
         )
         invalidDocuments.forEach { document ->
             assertThrows(LiveProtocolException::class.java) {

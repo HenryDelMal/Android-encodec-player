@@ -88,6 +88,9 @@ segments. Live mode displays connection status, queued segment count, sequence,
 bitrate, and codebooks. Seeking, previous/next, shuffle, and repeat are disabled
 until **Disconnect** returns the app to normal playlist mode.
 
+If the manifest includes an optional top-level `title` string, the app uses it
+for Now Playing, Android media controls, and the saved livestream name.
+
 Saved live URLs are remembered, but playback never starts automatically when
 the app launches. The server must publish complete, independent ECDC v0 files
 using the `encodec_24khz` mono or `encodec_48khz` stereo model, a codebook count

@@ -41,6 +41,7 @@ data class LiveManifest(
     val targetDuration: Double,
     val init: LiveCodecInit,
     val segments: List<LiveSegmentInfo>,
+    val title: String? = null,
 )
 
 data class LiveSelection(val segment: LiveSegmentInfo, val discontinuity: Boolean)
@@ -65,6 +66,8 @@ object LiveManifestParser {
         protocol(root.getInt("version") == 1) { "Unsupported live manifest version" }
         protocol(root.getBoolean("independent_segments")) { "Live segments are not independent" }
         Instant.parse(root.getString("updated_at"))
+        val title = root.optString("title", "").trim().takeIf { it.isNotEmpty() }
+        protocol(title == null || title.length <= MAX_TITLE_LENGTH) { "Invalid live stream title" }
         val mediaSequence = root.getLong("media_sequence")
         val discontinuitySequence = root.getLong("discontinuity_sequence")
         protocol(mediaSequence >= 0 && discontinuitySequence >= 0) { "Invalid manifest sequence" }
@@ -132,7 +135,7 @@ object LiveManifestParser {
         protocol(segments.firstOrNull()?.sequence?.let { it == mediaSequence } ?: true) {
             "media_sequence does not match the first segment"
         }
-        LiveManifest(mediaSequence, discontinuitySequence, targetDuration, init, segments)
+        LiveManifest(mediaSequence, discontinuitySequence, targetDuration, init, segments, title)
     } catch (error: LiveProtocolException) {
         throw error
     } catch (error: Exception) {
@@ -148,6 +151,7 @@ object LiveManifestParser {
 
     internal const val MAX_SEGMENT_BYTES = 8 * 1024 * 1024
     internal const val MAX_MANIFEST_BYTES = 1024 * 1024
+    internal const val MAX_TITLE_LENGTH = 200
     internal fun supportedCodebooks(variant: EncodecVariant): Set<Int> = when (variant) {
         EncodecVariant.MONO_24_KHZ -> setOf(2, 4, 8, 16, 32)
         EncodecVariant.STEREO_48_KHZ -> setOf(2, 4, 8, 16)
@@ -215,6 +219,8 @@ class LiveStreamSource(
     private var retryCount = 0
     private var cachedManifest: LiveManifest? = null
     private var streamInit: LiveCodecInit? = null
+    var streamTitle: String? = null
+        private set
 
     suspend fun initialize(onStatus: (String) -> Unit): LiveCodecInit {
         streamInit?.let { return it }
@@ -281,6 +287,7 @@ class LiveStreamSource(
         tracker.reset()
         cachedManifest = null
         streamInit = null
+        streamTitle = null
     }
 
     private fun pollDelayMillis(manifest: LiveManifest): Long =
@@ -296,6 +303,7 @@ class LiveStreamSource(
             throw LiveProtocolException("Live codec initialization changed")
         }
         streamInit = manifest.init
+        streamTitle = manifest.title
         cachedManifest = manifest
         return manifest
     }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.1
+
+- Added support for the optional top-level EnCodec Live `title` field.
+- Manifest titles now appear in Now Playing and Android media controls and
+  replace URL-derived names in the persistent Saved livestreams menu.
+- Livestream manifests without a title remain compatible and continue using
+  the URL-derived fallback name.
+
 ## 0.10.0
 
 - Added a separate persistent Saved livestreams menu. Opening a live manifest

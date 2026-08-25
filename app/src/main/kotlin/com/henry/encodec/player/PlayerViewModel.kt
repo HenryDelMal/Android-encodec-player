@@ -300,8 +300,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         requestedStartSample = 0
         stopInternal(resetProgress = true)
         playlistStore.saveLastLiveUrl(uri.toString())
-        val stream = SavedLiveStream(uri.toString(), liveDisplayName(uri))
         val snapshot = mutableState.value
+        val stream = snapshot.livestreams.firstOrNull { it.manifestUrl == uri.toString() }
+            ?: SavedLiveStream(uri.toString(), liveDisplayName(uri))
         val savedStreams = if (snapshot.livestreams.any { it.manifestUrl == stream.manifestUrl }) {
             snapshot.livestreams
         } else {
@@ -583,13 +584,30 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             val streamInit = source.initialize { status ->
                                 publishBuffer(status, buffering = true)
                             }
-                            mutableState.value = mutableState.value.copy(
-                                live = mutableState.value.live?.copy(
+                            val manifestTitle = source.streamTitle
+                            val initializedState = mutableState.value
+                            val titledStreams = if (manifestTitle != null) {
+                                initializedState.livestreams.map { saved ->
+                                    if (saved.manifestUrl == live.manifestUrl) {
+                                        saved.copy(title = manifestTitle)
+                                    } else {
+                                        saved
+                                    }
+                                }
+                            } else {
+                                initializedState.livestreams
+                            }
+                            val initializedLive = initializedState.live
+                            mutableState.value = initializedState.copy(
+                                livestreams = titledStreams,
+                                live = initializedLive?.copy(
+                                    title = manifestTitle ?: initializedLive.title,
                                     variant = streamInit.variant,
                                     codebooks = streamInit.codebooks,
                                     bandwidthKbps = streamInit.bandwidthKbps,
                                 ),
                             )
+                            if (manifestTitle != null) persistPlaylist()
                             val producer = launch(Dispatchers.IO) {
                                 try {
                                     // Keep preparing manifest-listed segments in
