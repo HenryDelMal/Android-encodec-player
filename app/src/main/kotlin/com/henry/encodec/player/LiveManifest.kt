@@ -3,6 +3,8 @@ package com.henry.encodec.player
 import com.henry.encodec.ecdc.EcdcReader
 import com.henry.encodec.ecdc.EncodecVariant
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -208,11 +210,21 @@ class LiveSequenceTracker {
 
 class LiveStreamSource(
     private val manifestUrl: String,
+    private val networkDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val fetchManifestBytes: suspend () -> ByteArray = {
-        HttpsStreams.readBytes(manifestUrl, LiveManifestParser.MAX_MANIFEST_BYTES, noCache = true)
+        HttpsStreams.readBytes(
+            manifestUrl,
+            LiveManifestParser.MAX_MANIFEST_BYTES,
+            noCache = true,
+            dispatcher = networkDispatcher,
+        )
     },
     private val fetchSegmentBytes: suspend (String) -> ByteArray = { url ->
-        HttpsStreams.readBytes(url, LiveManifestParser.MAX_SEGMENT_BYTES)
+        HttpsStreams.readBytes(
+            url,
+            LiveManifestParser.MAX_SEGMENT_BYTES,
+            dispatcher = networkDispatcher,
+        )
     },
 ) {
     private val tracker = LiveSequenceTracker()

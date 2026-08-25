@@ -1,5 +1,6 @@
 package com.henry.encodec.player
 
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -77,8 +78,13 @@ internal object HttpsStreams {
     }
 
     /** Cancellable, bounded HTTP(S) download used by live manifests and segments. */
-    suspend fun readBytes(url: String, maxBytes: Int, noCache: Boolean = false): ByteArray =
-        withContext(Dispatchers.IO) {
+    suspend fun readBytes(
+        url: String,
+        maxBytes: Int,
+        noCache: Boolean = false,
+        dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    ): ByteArray =
+        withContext(dispatcher) {
             require(maxBytes > 0)
             val activeConnection = AtomicReference<HttpURLConnection?>()
             val cancellation = coroutineContext.job.invokeOnCompletion {

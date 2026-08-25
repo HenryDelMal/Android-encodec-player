@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.4
+
+- Isolated live manifest and segment HTTP work on a dedicated sequential
+  downloader thread so blocking native decoding cannot delay network prefetch.
+- Kept ordered downloads and the existing HTTP keep-alive behavior while
+  separating the producer from the decoder executor.
+
 ## 0.10.3
 
 - Kept one-segment immediate livestream startup while allowing the background

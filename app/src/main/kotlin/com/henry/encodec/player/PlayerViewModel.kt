@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -52,6 +53,7 @@ import java.io.SequenceInputStream
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 data class PlaylistItem(
     val uri: Uri,
@@ -126,6 +128,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private var requestedStartSample = 0L
     private val shufflePlayedUris = mutableSetOf<String>()
     private val decoderMutex = Mutex()
+    private val liveDownloadDispatcher = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "EnCodecLiveDownloader")
+    }.asCoroutineDispatcher()
     private var cachedDecoder: EncodecDecoder? = null
     private var cachedAudioSink: AudioTrackSink? = null
     private val remoteHeaderPrefixes = ConcurrentHashMap<String, ByteArray>()
@@ -564,7 +569,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 decoderMutex.withLock {
                     coroutineScope {
-                            val source = LiveStreamSource(live.manifestUrl)
+                            val source = LiveStreamSource(
+                                live.manifestUrl,
+                                networkDispatcher = liveDownloadDispatcher,
+                            )
                             val queue = Channel<DownloadedLiveSegment>(LIVE_PREFETCH_CAPACITY)
                             val buffered = AtomicInteger(0)
                             val targetBuffer = AtomicInteger(LIVE_REBUFFER_TARGET_SEGMENTS)
@@ -611,7 +619,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                 ),
                             )
                             if (manifestTitle != null) persistPlaylist()
-                            val producer = launch(Dispatchers.IO) {
+                            val producer = launch(liveDownloadDispatcher) {
                                 try {
                                     // Keep preparing manifest-listed segments in
                                     // the background until the queue is full.
@@ -1086,6 +1094,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         manager.cancel(MEDIA_NOTIFICATION_ID)
         if (activeInstance?.get() === this) activeInstance = null
         mediaSession.release()
+        liveDownloadDispatcher.close()
         super.onCleared()
     }
 
