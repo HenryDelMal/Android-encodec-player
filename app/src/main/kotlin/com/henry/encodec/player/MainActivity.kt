@@ -472,7 +472,7 @@ private fun NowPlaying(state: PlayerState) {
             val details = buildList {
                 live.bandwidthKbps?.let { add("${formatNumber(it)} kbps") }
                 live.codebooks?.let { add("$it codebooks") }
-                add("${live.bufferedSegments}/${live.targetBufferedSegments} downloaded")
+                add("${live.bufferedSegments}/${live.targetBufferedSegments} queued")
                 live.variant?.let { add(formatAudioFormat(it)) }
             }
             Text(details.joinToString(" • "), style = MaterialTheme.typography.bodySmall)

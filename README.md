@@ -61,9 +61,10 @@ Language-model entropy coding is not supported for either variant.
 - Native EnCodec Live v1 playback from rolling `stream.json` manifests over
   HTTP or HTTPS.
 - Playback starts after the first verified live segment. Further segments are
-  downloaded into a bounded background queue while that segment plays, and the
-  rebuffer target grows after actual rebuffer events to absorb poor-network
-  jitter.
+  downloaded into a bounded background queue while that segment plays. The
+  queue fills with two safe successors before segment 2 is consumed, providing
+  three downloaded segments in total. Its target grows after actual rebuffer
+  events to absorb poor-network jitter.
 - Live manifest windows are consumed locally and fully read HTTP responses
   reuse keep-alive connections, reducing repeated DNS and TLS work.
 - Live-edge startup, manifest polling, ordered sequence playback, cleanup-window

@@ -67,9 +67,9 @@ class LiveManifestTest {
     }
 
     @Test
-    fun startsPlaybackWithOneSegmentButUsesTargetAfterARebuffer() {
-        assertEquals(1, requiredLiveBufferDepth(deliveredSegments = 0, rebufferTarget = 3))
-        assertEquals(3, requiredLiveBufferDepth(deliveredSegments = 1, rebufferTarget = 3))
+    fun startsPlaybackWithOneSegmentThenFillsTheBackgroundTarget() {
+        assertEquals(1, requiredLiveBufferDepth(deliveredSegments = 0, rebufferTarget = 2))
+        assertEquals(2, requiredLiveBufferDepth(deliveredSegments = 1, rebufferTarget = 2))
     }
 
     @Test

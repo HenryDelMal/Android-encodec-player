@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.3
+
+- Kept one-segment immediate livestream startup while allowing the background
+  downloader to queue two safe successors before segment 2 is consumed. With
+  the current segment, this provides three downloaded segments in total.
+- Renamed the live counter from `downloaded` to `queued`; it intentionally does
+  not include the segment already handed to the decoder or `AudioTrack`.
+
 ## 0.10.2
 
 - Restored immediate livestream startup after the first verified segment instead

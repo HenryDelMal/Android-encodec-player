@@ -646,8 +646,26 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     )
                                     liveSession = newSession
                                     var deliveredSegments = 0
+                                    var initialCushionFilled = false
                                     newSession.play(
                                         nextSegment = {
+                                            if (deliveredSegments == 1 && !initialCushionFilled) {
+                                                val requiredDepth = requiredLiveBufferDepth(
+                                                    deliveredSegments,
+                                                    targetBuffer.get(),
+                                                )
+                                                while (buffered.get() < requiredDepth &&
+                                                    !producer.isCompleted
+                                                ) {
+                                                    publishBuffer(
+                                                        "Preparing background queue " +
+                                                            "${buffered.get()}/$requiredDepth…",
+                                                        buffering = false,
+                                                    )
+                                                    kotlinx.coroutines.delay(25)
+                                                }
+                                                initialCushionFilled = true
+                                            }
                                             if (buffered.get() == 0) {
                                                 if (deliveredSegments > 0) {
                                                     val events = rebufferEvents.incrementAndGet()
@@ -1081,7 +1099,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.CYCLE_REPEAT"
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
-        private const val LIVE_REBUFFER_TARGET_SEGMENTS = 3
+        // The current segment is already in the decoder/AudioTrack, so two
+        // compressed successors provide a three-segment total cushion.
+        private const val LIVE_REBUFFER_TARGET_SEGMENTS = 2
         private const val LIVE_MAX_BUFFER_SEGMENTS = 6
         private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
         private const val REBUFFERS_PER_BUFFER_INCREASE = 1
