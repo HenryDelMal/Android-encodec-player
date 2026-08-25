@@ -1,6 +1,8 @@
 .gradle/
 .kotlin/
 .idea/
+.android-ndk/
+.cxx/
 .DS_Store
 __pycache__/
 local.properties
@@ -8,3 +10,5 @@ local.properties
 *.iml
 app/src/main/assets/*.pte
 app/src/main/assets/*.onnx
+app/src/main/assets/*.bin
+output/*.apk

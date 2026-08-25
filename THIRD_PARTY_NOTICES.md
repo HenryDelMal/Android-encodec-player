@@ -2,7 +2,7 @@
 
 ## EnCodec
 
-The generated `encodec_48khz_decoder.pte` contains parameters from Meta's
+The generated 24 kHz and 48 kHz decoder files contain parameters from Meta's
 [EnCodec project](https://github.com/facebookresearch/encodec).
 
 MIT License
@@ -26,3 +26,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## encodec.cpp
+
+The native decoder is derived from
+[pfeatherstone/encodec.cpp](https://github.com/pfeatherstone/encodec.cpp) and
+the dual-model fork at
+[HenryDelMal/encodec.cpp](https://github.com/HenryDelMal/encodec.cpp). It is
+distributed under the MIT License. Its license is included at
+`core/decoder/src/main/cpp/encodec/LICENSE`.
+
+## Eigen
+
+The native decoder vendors Eigen headers. Eigen is primarily distributed under
+the Mozilla Public License 2.0. The included license is at
+`core/decoder/src/main/cpp/third_party/eigen/COPYING.MPL2`.

@@ -55,11 +55,11 @@ class EcdcReaderTest {
             assertContentEquals(expected.copyOfRange(0, 300 * codebooks), first.codes)
 
             val second = requireNotNull(reader.readFrame())
-            assertEquals(83, second.timeSteps)
+            assertEquals(150, second.timeSteps)
             assertEquals(96_000, second.outputOffsetSamples)
             assertEquals(24_000, second.outputLengthSamples)
-            assertEquals(2_560, second.trimLeadingSamples)
-            assertContentEquals(expected.copyOfRange(292 * codebooks, expected.size), second.codes)
+            assertEquals(24_000, second.trimLeadingSamples)
+            assertContentEquals(expected.copyOfRange(225 * codebooks, expected.size), second.codes)
             assertEquals(null, reader.readFrame())
         }
     }
@@ -76,6 +76,35 @@ class EcdcReaderTest {
             headerBytes.size.toLong() + 7L * bytesPerFrame,
             EcdcReader.frameByteOffset(header, headerBytes.size, 7),
         )
+    }
+
+    @Test
+    fun `calculates byte aligned mono chunk offsets`() {
+        val codebooks = 2
+        val codes = IntArray(3_000 * codebooks) { (it * 31) % 1024 }
+        val bytes = file("encodec_24khz", 960_000, codebooks, false, codes)
+        val headerBytes = EcdcReader.readHeaderBytes(ByteArrayInputStream(bytes))
+        val header = EcdcReader.inspect(ByteArrayInputStream(headerBytes))
+        val chunkIndex = 6
+        val bytesPerChunk = 300L * codebooks * 10L / 8L
+        val offset = EcdcReader.monoChunkByteOffset(header, headerBytes.size, chunkIndex)
+
+        assertEquals(
+            headerBytes.size.toLong() + chunkIndex * bytesPerChunk,
+            offset,
+        )
+        val rangedFile = headerBytes + bytes.copyOfRange(offset.toInt(), bytes.size)
+        EcdcReader(ByteArrayInputStream(rangedFile), initialFrameIndex = chunkIndex).use { reader ->
+            val frame = requireNotNull(reader.readFrame())
+            assertEquals(chunkIndex.toLong() * EcdcReader.MONO_CHUNK_SAMPLES, frame.outputOffsetSamples)
+            assertContentEquals(
+                codes.copyOfRange(
+                    chunkIndex * 300 * codebooks,
+                    (chunkIndex + 1) * 300 * codebooks,
+                ),
+                frame.codes,
+            )
+        }
     }
 
     private fun file(model: String, length: Int, codebooks: Int, lm: Boolean, codes: IntArray): ByteArray {

@@ -150,6 +150,21 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
             return headerBytes.toLong() + frameIndex.toLong() * frameBytes
         }
 
+        /**
+         * Byte position of a four-second 24 kHz reader chunk. The official
+         * payload is one continuous 10-bit stream, but a 300-step chunk is
+         * always byte-aligned for every supported codebook count.
+         */
+        fun monoChunkByteOffset(header: EcdcHeader, headerBytes: Int, chunkIndex: Int): Long {
+            require(header.variant == EncodecVariant.MONO_24_KHZ)
+            require(chunkIndex >= 0)
+            val timeStepsPerChunk = MONO_CHUNK_SAMPLES.toLong() *
+                header.variant.frameRate / header.variant.sampleRate
+            val bitsPerChunk = timeStepsPerChunk * header.numCodebooks * 10L
+            require(bitsPerChunk % 8L == 0L)
+            return headerBytes.toLong() + chunkIndex.toLong() * (bitsPerChunk / 8L)
+        }
+
         private fun readHeader(source: DataInputStream): EcdcHeader {
             val actualMagic = ByteArray(4).also(source::readFully)
             if (!actualMagic.contentEquals(magic)) throw EcdcFormatException("File is not in ECDC format")
@@ -188,7 +203,8 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
         }
 
         const val MONO_CHUNK_SAMPLES = 96_000
-        const val MONO_CONTEXT_TIME_STEPS = 8
+        /** One causal second, matching the bounded C++ command-line decoder. */
+        const val MONO_CONTEXT_TIME_STEPS = 75
 
         // The version-0 header has four fixed primitive fields. Keeping this parser small
         // prevents a JSON library from becoming part of the decoder's hot-path artifact.
