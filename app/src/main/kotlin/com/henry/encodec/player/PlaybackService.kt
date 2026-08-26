@@ -6,13 +6,11 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 
 class PlaybackService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -22,17 +20,11 @@ class PlaybackService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "EncodecPlayer:Playback")
             .apply {
                 setReferenceCounted(false)
-                acquire()
-            }
-        wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
-            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "EncodecPlayer:Streaming")
-            .apply {
-                setReferenceCounted(false)
-                acquire()
             }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        setPlaybackActive(intent?.getBooleanExtra(EXTRA_PLAYBACK_ACTIVE, true) != false)
         PlayerViewModel.refreshMediaState()
         return START_NOT_STICKY
     }
@@ -40,11 +32,18 @@ class PlaybackService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        if (wifiLock?.isHeld == true) wifiLock?.release()
         if (wakeLock?.isHeld == true) wakeLock?.release()
-        wifiLock = null
         wakeLock = null
         super.onDestroy()
+    }
+
+    private fun setPlaybackActive(active: Boolean) {
+        val lock = wakeLock ?: return
+        if (active && !lock.isHeld) {
+            lock.acquire()
+        } else if (!active && lock.isHeld) {
+            lock.release()
+        }
     }
 
     private fun createNotificationChannel() {
@@ -66,4 +65,8 @@ class PlaybackService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .build()
+
+    companion object {
+        const val EXTRA_PLAYBACK_ACTIVE = "playback_active"
+    }
 }

@@ -50,6 +50,11 @@ class PlaylistStore(context: Context) {
                         SavedLiveStream(
                             manifestUrl = manifestUrl,
                             title = item.optString("title", manifestUrl),
+                            variant = item.optString("variant").takeIf { it.isNotBlank() }
+                                ?.let(EncodecVariant::fromWireName),
+                            codebooks = item.optInt("codebooks", 0).takeIf { it > 0 },
+                            bandwidthKbps = item.optDouble("bandwidthKbps", Double.NaN)
+                                .takeIf { it.isFinite() },
                         ),
                     )
                 }
@@ -61,6 +66,7 @@ class PlaylistStore(context: Context) {
             currentIndex = if (items.isEmpty()) -1 else storedIndex.coerceIn(items.indices),
             shuffle = root.optBoolean("shuffle", false),
             repeatMode = repeatMode,
+            diagnosticsEnabled = root.optBoolean("diagnosticsEnabled", false),
         )
     }.getOrElse { PlayerState() }
 
@@ -83,7 +89,12 @@ class PlaylistStore(context: Context) {
             livestreams.put(
                 JSONObject()
                     .put("manifestUrl", stream.manifestUrl)
-                    .put("title", stream.title),
+                    .put("title", stream.title)
+                    .apply {
+                        stream.variant?.let { put("variant", it.wireName) }
+                        stream.codebooks?.let { put("codebooks", it) }
+                        stream.bandwidthKbps?.let { put("bandwidthKbps", it) }
+                    },
             )
         }
         val root = JSONObject()
@@ -92,6 +103,7 @@ class PlaylistStore(context: Context) {
             .put("currentIndex", state.currentIndex)
             .put("shuffle", state.shuffle)
             .put("repeatMode", state.repeatMode.name)
+            .put("diagnosticsEnabled", state.diagnosticsEnabled)
         preferences.edit().putString(PLAYLIST_KEY, root.toString()).apply()
     }
 

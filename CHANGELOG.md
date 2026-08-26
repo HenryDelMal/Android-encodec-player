@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.10.7
+
+- Added Android Performance Hint integration for the existing single native
+  decoder worker. Android 15 devices are asked to prefer power-efficient CPU
+  scheduling with a safe deadline derived from each audio frame's duration.
+- Removed the high-performance Wi-Fi lock that kept Wi-Fi in a high-power mode
+  during locked-screen playback. The partial CPU wake lock is now released
+  while playback is paused.
+- Made verbose native, network, queue and AudioTrack diagnostics optional and
+  disabled by default, with an in-app toggle for troubleshooting.
+- Reduced locked-screen/UI work by lowering finite-file position updates to
+  once per second and polling unchanged live manifests less aggressively.
+- Added gzip support for `stream.json` while keeping ECDC segment compression
+  disabled.
+- Consume every complete segment listed by one manifest response and batch
+  subsequent manifest refreshes around buffered playback. This reduces tiny
+  radio wakeups on both Wi-Fi and mobile data without increasing live latency.
+- Increased the one-response startup window to six segments while retaining
+  immediate playback after the first download; remaining segments are fetched
+  by the background producer.
+- Cached saved-stream codec metadata so the expected decoder can load in
+  parallel with a slow manifest request. The downloaded manifest remains
+  authoritative and stale cached parameters are never used for playback.
+- Automatically reconnect and rebuild the decoder and AudioTrack when a live
+  manifest changes its model, sample rate, channels, codebooks or bitrate.
+- Removed unconditional 48 kHz model preloading, which could delay a 24 kHz
+  stream by loading and immediately replacing the wrong model.
+
+## 0.10.6
+
+- Detect stalled live requests after five seconds and retry them on a fresh
+  connection instead of letting a dead response block the downloader for up
+  to 30 seconds.
+- Increased the initial background cushion to three queued successors while
+  retaining immediate playback as soon as the first segment is available.
+- Grow the adaptive buffer target proactively when a segment takes longer to
+  download than its playback duration.
+- Added response-header and body timings plus decoder initialization timing to
+  the `EnCodecLive` diagnostic log.
+- Corrected the startup status so stream-format checking and decoder loading
+  are reported as separate operations.
+
+## 0.10.5
+
+- Added an `EnCodecLive` diagnostic timeline for manifest fetches, segment
+  downloads, compressed queue changes, rebuffer events, decoding and
+  `AudioTrack` back-pressure.
+- Included sequence numbers, elapsed times, byte counts, queue depths and
+  thread names so slow live playback can be diagnosed from one filtered log.
+
 ## 0.10.4
 
 - Isolated live manifest and segment HTTP work on a dedicated sequential

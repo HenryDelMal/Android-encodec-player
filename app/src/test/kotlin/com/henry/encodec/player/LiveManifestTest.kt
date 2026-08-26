@@ -60,10 +60,10 @@ class LiveManifestTest {
     }
 
     @Test
-    fun startsWithThreeSafeSegmentsAvailableBeforeLiveEdge() {
+    fun startsWithSixSegmentsAvailableThroughPublishedEdge() {
         val tracker = LiveSequenceTracker()
         val manifest = manifest((10L..15L).map(::info))
-        assertEquals(11L, tracker.select(manifest)?.sequence)
+        assertEquals(10L, tracker.select(manifest)?.sequence)
     }
 
     @Test
@@ -82,16 +82,18 @@ class LiveManifestTest {
     }
 
     @Test
-    fun progressesInSequenceWhileKeepingTwoSegmentLiveEdgeMargin() {
+    fun progressesThroughEveryPublishedSegmentBeforeRefreshing() {
         val tracker = LiveSequenceTracker()
         val firstManifest = manifest((30L..34L).map(::info))
         assertEquals(30, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertEquals(31, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertEquals(32, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
+        assertEquals(33, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
+        assertEquals(34, tracker.accept(requireNotNull(tracker.select(firstManifest))).segment.sequence)
         assertNull(tracker.select(firstManifest))
 
         val updatedManifest = manifest((30L..35L).map(::info))
-        assertEquals(33, tracker.accept(requireNotNull(tracker.select(updatedManifest))).segment.sequence)
+        assertEquals(35, tracker.accept(requireNotNull(tracker.select(updatedManifest))).segment.sequence)
         assertNull(tracker.select(updatedManifest))
     }
 
@@ -101,7 +103,7 @@ class LiveManifestTest {
         tracker.accept(info(40))
         val overtaken = manifest((50L..55L).map(::info))
         val selected = requireNotNull(tracker.select(overtaken))
-        assertEquals(51, selected.sequence)
+        assertEquals(50, selected.sequence)
         assertTrue(tracker.accept(selected).discontinuity)
     }
 
@@ -190,7 +192,7 @@ class LiveManifestTest {
         val manifest = manifest((80L..85L).map(::info))
         tracker.accept(requireNotNull(tracker.select(manifest)))
         tracker.reset()
-        assertEquals(81L, tracker.select(manifest)?.sequence)
+        assertEquals(80L, tracker.select(manifest)?.sequence)
 
         val source = LiveStreamSource(
             MANIFEST_URL,
@@ -211,7 +213,7 @@ class LiveManifestTest {
     }
 
     @Test
-    fun sourceRefreshesBeforeEnteringProtectedLiveEdge() = runBlocking {
+    fun sourceUsesWholeManifestBatchBeforeRefreshing() = runBlocking {
         val bytes = ecdcHeader(96_000, 8)
         val hash = bytes.sha256()
         var manifestFetches = 0
@@ -229,7 +231,7 @@ class LiveManifestTest {
         assertEquals(EncodecVariant.STEREO_48_KHZ, source.initialize {}.variant)
         assertEquals(1L, source.nextSegment {}.sequence)
         assertEquals(2L, source.nextSegment {}.sequence)
-        assertEquals(2, manifestFetches)
+        assertEquals(1, manifestFetches)
     }
 
     private fun manifest(segments: List<LiveSegmentInfo>) = LiveManifest(

@@ -64,6 +64,9 @@ data class PlaylistItem(
 data class SavedLiveStream(
     val manifestUrl: String,
     val title: String,
+    val variant: EncodecVariant? = null,
+    val codebooks: Int? = null,
+    val bandwidthKbps: Double? = null,
 )
 
 data class LiveUiState(
@@ -99,6 +102,7 @@ data class PlayerState(
     val addingUrl: Boolean = false,
     val live: LiveUiState? = null,
     val error: String? = null,
+    val diagnosticsEnabled: Boolean = false,
 ) {
     val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
 }
@@ -154,19 +158,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     init {
+        LiveDiagnostics.enabled = mutableState.value.diagnosticsEnabled
         removeObsoleteDecoderModels()
         activeInstance = WeakReference(this)
-        // Loading the model is the largest one-time startup cost. Begin while
-        // the user is choosing a track instead of waiting for Play or Seek.
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                decoderMutex.withLock {
-                    val variant = EncodecVariant.STEREO_48_KHZ
-                    decoderFor(decoderConfig(variant), variant)
-                    audioSink(variant)
-                }
-            }
-        }
         viewModelScope.launch {
             // Playback position changes frequently. Android's media session can
             // extrapolate between updates, so rebuilding the notification for
@@ -318,7 +312,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
         mutableState.value = snapshot.copy(
             livestreams = savedStreams,
-            live = LiveUiState(stream.manifestUrl, stream.title),
+            live = LiveUiState(
+                manifestUrl = stream.manifestUrl,
+                title = stream.title,
+                variant = stream.variant,
+                codebooks = stream.codebooks,
+                bandwidthKbps = stream.bandwidthKbps,
+            ),
             playing = false,
             paused = false,
             progress = 0f,
@@ -398,6 +398,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 session?.resume()
                 liveSession?.resume()
                 mutableState.value = snapshot.copy(paused = false)
+                setPlaybackWakeActive(true)
             }
         }
     }
@@ -408,6 +409,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             session?.pause()
             liveSession?.pause()
             mutableState.value = snapshot.copy(paused = true)
+            setPlaybackWakeActive(false)
         }
     }
 
@@ -474,6 +476,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         persistPlaylist()
     }
 
+    fun toggleDiagnostics() {
+        val enabled = !mutableState.value.diagnosticsEnabled
+        LiveDiagnostics.enabled = enabled
+        mutableState.value = mutableState.value.copy(diagnosticsEnabled = enabled)
+        persistPlaylist()
+    }
+
     fun seekToFraction(fraction: Float) {
         val snapshot = mutableState.value
         if (snapshot.live != null) return
@@ -504,6 +513,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             livestreams = snapshot.livestreams,
             shuffle = snapshot.shuffle,
             repeatMode = snapshot.repeatMode,
+            diagnosticsEnabled = snapshot.diagnosticsEnabled,
         )
         persistPlaylist()
     }
@@ -562,7 +572,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 paused = false,
                 error = null,
                 live = mutableState.value.live?.copy(
-                    status = "Loading decoder…",
+                    status = "Checking stream format…",
                     buffering = true,
                 ),
             )
@@ -592,21 +602,28 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     ),
                                 )
                             }
+                            val cachedVariant = live.variant
+                            val cachedDecoder = cachedVariant?.let { variant ->
+                                async(Dispatchers.IO) {
+                                    decoderFor(decoderConfig(variant), variant) to audioSink(variant)
+                                }
+                            }
                             val streamInit = source.initialize { status ->
                                 publishBuffer(status, buffering = true)
                             }
                             val manifestTitle = source.streamTitle
                             val initializedState = mutableState.value
-                            val titledStreams = if (manifestTitle != null) {
-                                initializedState.livestreams.map { saved ->
-                                    if (saved.manifestUrl == live.manifestUrl) {
-                                        saved.copy(title = manifestTitle)
-                                    } else {
-                                        saved
-                                    }
+                            val titledStreams = initializedState.livestreams.map { saved ->
+                                if (saved.manifestUrl == live.manifestUrl) {
+                                    saved.copy(
+                                        title = manifestTitle ?: saved.title,
+                                        variant = streamInit.variant,
+                                        codebooks = streamInit.codebooks,
+                                        bandwidthKbps = streamInit.bandwidthKbps,
+                                    )
+                                } else {
+                                    saved
                                 }
-                            } else {
-                                initializedState.livestreams
                             }
                             val initializedLive = initializedState.live
                             mutableState.value = initializedState.copy(
@@ -618,7 +635,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     bandwidthKbps = streamInit.bandwidthKbps,
                                 ),
                             )
-                            if (manifestTitle != null) persistPlaylist()
+                            persistPlaylist()
                             val producer = launch(liveDownloadDispatcher) {
                                 try {
                                     // Keep preparing manifest-listed segments in
@@ -627,6 +644,23 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                         val downloaded = source.nextSegment { status ->
                                             if (buffered.get() == 0) publishBuffer(status, buffering = true)
                                         }
+                                        if (downloaded.downloadMillis >=
+                                            (downloaded.durationSeconds * 1_000).toLong()
+                                        ) {
+                                            val previousTarget = targetBuffer.get()
+                                            val newTarget = targetBuffer.updateAndGet { current ->
+                                                (current + 1).coerceAtMost(LIVE_MAX_BUFFER_SEGMENTS)
+                                            }
+                                            if (newTarget != previousTarget) {
+                                                LiveDiagnostics.warn(
+                                                    "slow segment seq=${downloaded.sequence} " +
+                                                        "downloadMs=${downloaded.downloadMillis} " +
+                                                        "durationMs=" +
+                                                        "${(downloaded.durationSeconds * 1_000).toLong()} " +
+                                                        "newTarget=$newTarget",
+                                                )
+                                            }
+                                        }
                                         buffered.incrementAndGet()
                                         try {
                                             queue.send(downloaded)
@@ -634,23 +668,48 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                             buffered.decrementAndGet()
                                             throw error
                                         }
+                                        LiveDiagnostics.info(
+                                            "queue add seq=${downloaded.sequence} depth=${buffered.get()} " +
+                                                "target=${targetBuffer.get()} capacity=$LIVE_PREFETCH_CAPACITY " +
+                                                "manifestEdge=${downloaded.reachedManifestEdge}",
+                                        )
                                         publishBuffer()
+                                        if (downloaded.reachedManifestEdge) {
+                                            // The manifest supplied a complete batch. Let that
+                                            // buffered audio play before waking Wi-Fi or the
+                                            // cellular modem for another manifest request.
+                                            while (isActive && buffered.get() > targetBuffer.get()) {
+                                                kotlinx.coroutines.delay(100)
+                                            }
+                                        }
                                     }
                                 } finally {
                                     queue.close()
                                 }
                             }
                             try {
-                                publishBuffer("Buffering live audio…", buffering = true)
+                                publishBuffer("Loading decoder…", buffering = true)
                                 val config = decoderConfig(streamInit.variant)
-                                val (decoder, sink) = withContext(Dispatchers.IO) {
-                                    decoderFor(config, streamInit.variant) to
-                                        audioSink(streamInit.variant)
+                                val decoderStarted = LiveDiagnostics.nowMs()
+                                val (decoder, sink) = if (cachedVariant == streamInit.variant) {
+                                    requireNotNull(cachedDecoder).await()
+                                } else {
+                                    cachedDecoder?.await()
+                                    withContext(Dispatchers.IO) {
+                                        decoderFor(config, streamInit.variant) to
+                                            audioSink(streamInit.variant)
+                                    }
                                 }
+                                LiveDiagnostics.info(
+                                    "decoder ready variant=${streamInit.variant.wireName} " +
+                                        "elapsedMs=${LiveDiagnostics.nowMs() - decoderStarted}",
+                                )
+                                publishBuffer("Buffering live audio…", buffering = true)
                                 run {
                                     val newSession = LiveEcdcPlaybackSession(
                                         decoder,
                                         sink,
+                                        diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
                                     )
                                     liveSession = newSession
                                     var deliveredSegments = 0
@@ -682,6 +741,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                                             (current + 1).coerceAtMost(LIVE_MAX_BUFFER_SEGMENTS)
                                                         }
                                                     }
+                                                    LiveDiagnostics.warn(
+                                                        "rebuffer event=$events delivered=$deliveredSegments " +
+                                                            "newTarget=${targetBuffer.get()} producerDone=${producer.isCompleted}",
+                                                    )
                                                 }
                                                 val requiredDepth = requiredLiveBufferDepth(
                                                     deliveredSegments,
@@ -699,9 +762,15 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                                     kotlinx.coroutines.delay(50)
                                                 }
                                             }
+                                            val receiveStarted = LiveDiagnostics.nowMs()
                                             val downloaded = queue.receive()
+                                            val receiveWaitMs = LiveDiagnostics.nowMs() - receiveStarted
                                             buffered.decrementAndGet()
                                             deliveredSegments++
+                                            LiveDiagnostics.info(
+                                                "queue take seq=${downloaded.sequence} depth=${buffered.get()} " +
+                                                    "waitMs=$receiveWaitMs delivered=$deliveredSegments",
+                                            )
                                             publishBuffer(
                                                 "Decoding segment ${downloaded.sequence}…",
                                                 buffering = false,
@@ -741,6 +810,25 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (changed: LiveInitializationChangedException) {
+                if (playbackGeneration == generation) {
+                    mutableState.value = mutableState.value.copy(
+                        live = mutableState.value.live?.copy(
+                            status = "Stream format changed; reconnecting…",
+                            variant = changed.current.variant,
+                            codebooks = changed.current.codebooks,
+                            bandwidthKbps = changed.current.bandwidthKbps,
+                            bufferedSegments = 0,
+                            buffering = true,
+                        ),
+                    )
+                    viewModelScope.launch {
+                        kotlinx.coroutines.yield()
+                        if (playbackGeneration == generation && mutableState.value.live != null) {
+                            startLivePlayback()
+                        }
+                    }
+                }
             } catch (error: Throwable) {
                 if (playbackGeneration == generation) {
                     mutableState.value = mutableState.value.copy(
@@ -1108,9 +1196,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "com.henry.encodec.player.CYCLE_REPEAT"
         private const val MEDIA_ACTION_JUMP_TO_LIVE =
             "com.henry.encodec.player.JUMP_TO_LIVE"
-        // The current segment is already in the decoder/AudioTrack, so two
-        // compressed successors provide a three-segment total cushion.
-        private const val LIVE_REBUFFER_TARGET_SEGMENTS = 2
+        // The current segment is already in the decoder/AudioTrack, so three
+        // compressed successors provide a four-segment total cushion.
+        private const val LIVE_REBUFFER_TARGET_SEGMENTS = 3
         private const val LIVE_MAX_BUFFER_SEGMENTS = 6
         private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
         private const val REBUFFERS_PER_BUFFER_INCREASE = 1
@@ -1166,8 +1254,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun ensurePlaybackService() {
+        setPlaybackWakeActive(true)
+    }
+
+    private fun setPlaybackWakeActive(active: Boolean) {
         val application = getApplication<Application>()
         val intent = Intent(application, PlaybackService::class.java)
+            .putExtra(PlaybackService.EXTRA_PLAYBACK_ACTIVE, active)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             application.startForegroundService(intent)
         } else {
@@ -1394,6 +1487,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             copyAssetOnce(config.assetName),
             variant,
             rescale = true,
+            context = getApplication<Application>(),
+            diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
         ).also { cachedDecoder = it }
     }
 
@@ -1403,7 +1498,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }?.let { return it }
         cachedAudioSink?.close()
         cachedAudioSink = null
-        return AudioTrackSink(variant.sampleRate, variant.channels).also { cachedAudioSink = it }
+        return AudioTrackSink(
+            variant.sampleRate,
+            variant.channels,
+            diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
+        ).also { cachedAudioSink = it }
     }
 
     private fun copyAssetOnce(name: String): File {

@@ -13,11 +13,14 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.GZIPInputStream
 import kotlin.coroutines.coroutineContext
 
 internal object HttpsStreams {
     private const val MAX_REDIRECTS = 5
     private const val MAX_OPEN_ATTEMPTS = 3
+    private const val LIVE_CONNECT_TIMEOUT_MS = 4_000
+    private const val LIVE_READ_TIMEOUT_MS = 5_000
 
     /** Finite playlist URLs remain HTTPS-only at their initial address. */
     fun open(url: String): InputStream {
@@ -83,6 +86,7 @@ internal object HttpsStreams {
         maxBytes: Int,
         noCache: Boolean = false,
         dispatcher: CoroutineDispatcher = Dispatchers.IO,
+        acceptGzip: Boolean = false,
     ): ByteArray =
         withContext(dispatcher) {
             require(maxBytes > 0)
@@ -94,13 +98,20 @@ internal object HttpsStreams {
                 var lastError: IOException? = null
                 repeat(MAX_OPEN_ATTEMPTS) { attempt ->
                     coroutineContext.ensureActive()
+                    val attemptStarted = LiveDiagnostics.nowMs()
                     try {
-                        openOnce(
+                        val input = openOnce(
                             url = url,
                             noCache = noCache,
                             allowInitialHttp = true,
                             onConnection = activeConnection::set,
-                        ).use { input ->
+                            connectTimeoutMs = LIVE_CONNECT_TIMEOUT_MS,
+                            readTimeoutMs = LIVE_READ_TIMEOUT_MS,
+                            forceFreshConnection = attempt > 0,
+                            acceptGzip = acceptGzip,
+                        )
+                        val headersMs = LiveDiagnostics.nowMs() - attemptStarted
+                        input.use {
                             val declaredLength = activeConnection.get()?.contentLengthLong ?: -1L
                             if (declaredLength > maxBytes) {
                                 throw IOException("HTTP response exceeds $maxBytes bytes")
@@ -121,13 +132,23 @@ internal object HttpsStreams {
                             // HttpURLConnection's keep-alive pool. This avoids a
                             // fresh DNS lookup and TLS handshake per segment.
                             activeConnection.set(null)
+                            LiveDiagnostics.info(
+                                "http complete attempt=${attempt + 1} headersMs=$headersMs " +
+                                    "bodyMs=${LiveDiagnostics.nowMs() - attemptStarted - headersMs} " +
+                                    "bytes=${result.size} fresh=${attempt > 0}",
+                            )
                             return@withContext result
                         }
                     } catch (error: IOException) {
                         coroutineContext.ensureActive()
                         activeConnection.getAndSet(null)?.disconnect()
                         lastError = error
-                        if (attempt < MAX_OPEN_ATTEMPTS - 1) delay(500L * (attempt + 1))
+                        LiveDiagnostics.warn(
+                            "http failed attempt=${attempt + 1} elapsedMs=" +
+                                "${LiveDiagnostics.nowMs() - attemptStarted} " +
+                                "error=${error::class.java.simpleName}: ${error.message}",
+                        )
+                        if (attempt < MAX_OPEN_ATTEMPTS - 1) delay(200L * (attempt + 1))
                     }
                 }
                 throw lastError ?: IOException("Could not download the response")
@@ -145,6 +166,10 @@ internal object HttpsStreams {
         rangeStartInclusive: Long? = null,
         rangeEndInclusive: Int? = null,
         disconnectOnClose: Boolean = false,
+        connectTimeoutMs: Int = 15_000,
+        readTimeoutMs: Int = 30_000,
+        forceFreshConnection: Boolean = false,
+        acceptGzip: Boolean = false,
     ): InputStream {
         var current = URI(url)
         require(
@@ -159,11 +184,12 @@ internal object HttpsStreams {
             ) { "Redirect uses an unsupported protocol" }
             val connection = current.toURL().openConnection() as HttpURLConnection
             onConnection(connection)
-            connection.connectTimeout = 15_000
-            connection.readTimeout = 30_000
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = readTimeoutMs
             connection.instanceFollowRedirects = false
-            connection.setRequestProperty("Accept-Encoding", "identity")
-            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.8.11")
+            connection.setRequestProperty("Accept-Encoding", if (acceptGzip) "gzip" else "identity")
+            connection.setRequestProperty("User-Agent", "EnCodec-Android-Player/0.10.7")
+            if (forceFreshConnection) connection.setRequestProperty("Connection", "close")
             if (rangeStartInclusive != null || rangeEndInclusive != null) {
                 connection.setRequestProperty(
                     "Range",
@@ -182,10 +208,15 @@ internal object HttpsStreams {
                     connection.disconnect()
                     throw IOException("Server ignored the ECDC byte-range request")
                 }
-                return if (disconnectOnClose) {
-                    DisconnectingInputStream(connection.inputStream, connection)
+                val response = if (connection.contentEncoding.equals("gzip", ignoreCase = true)) {
+                    GZIPInputStream(connection.inputStream)
                 } else {
-                    KeepAliveInputStream(connection.inputStream)
+                    connection.inputStream
+                }
+                return if (disconnectOnClose) {
+                    DisconnectingInputStream(response, connection)
+                } else {
+                    KeepAliveInputStream(response)
                 }
             }
             if (status in 300..399 && redirectCount < MAX_REDIRECTS) {

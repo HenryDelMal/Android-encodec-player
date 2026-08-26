@@ -83,7 +83,7 @@ extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_henry_encodec_decoder_CppEncodecDecoder_nativeDecode(
     JNIEnv* env, jobject, jlong native_handle, jintArray codes_array,
     jint codebooks, jint time_steps, jint trim_leading_frames,
-    jint output_frames, jfloat frame_scale, jboolean rescale) {
+    jint output_frames, jfloat frame_scale, jboolean rescale, jboolean diagnostics) {
     try {
         DecoderHandle* handle = from_handle(native_handle);
         if (codebooks < 1 || static_cast<unsigned>(codebooks) > handle->info.max_quantizers ||
@@ -134,10 +134,12 @@ Java_com_henry_encodec_decoder_CppEncodecDecoder_nativeDecode(
         env->SetFloatArrayRegion(result, 0, static_cast<jsize>(output.size()), output.data());
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
-        __android_log_print(
-            ANDROID_LOG_INFO, TAG,
-            "C++ decoded %d steps (%d codebooks) in %lldms, peak=%.4f, gain=%.4f, threads=1",
-            time_steps, codebooks, static_cast<long long>(elapsed_ms), peak, gain);
+        if (diagnostics == JNI_TRUE) {
+            __android_log_print(
+                ANDROID_LOG_INFO, TAG,
+                "C++ decoded %d steps (%d codebooks) in %lldms, peak=%.4f, gain=%.4f, threads=1",
+                time_steps, codebooks, static_cast<long long>(elapsed_ms), peak, gain);
+        }
         return result;
     } catch (const std::exception& error) {
         throw_java(env, "java/lang/IllegalStateException", error.what());

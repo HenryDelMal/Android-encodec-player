@@ -1,5 +1,6 @@
 package com.henry.encodec.player
 
+import android.util.Log
 import com.henry.encodec.ecdc.EcdcReader
 import com.henry.encodec.ecdc.EncodecVariant
 import kotlinx.coroutines.CancellationException
@@ -17,6 +18,20 @@ import java.time.Instant
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.min
+
+internal object LiveDiagnostics {
+    @Volatile var enabled: Boolean = false
+
+    fun nowMs(): Long = System.nanoTime() / 1_000_000L
+    fun info(message: String) {
+        if (!enabled) return
+        runCatching { Log.i("EnCodecLive", message) }
+    }
+    fun warn(message: String) {
+        if (!enabled) return
+        runCatching { Log.w("EnCodecLive", message) }
+    }
+}
 
 data class LiveCodecInit(
     val variant: EncodecVariant,
@@ -54,10 +69,18 @@ data class DownloadedLiveSegment(
     val discontinuity: Boolean,
     val codebooks: Int,
     val bandwidthKbps: Double,
+    val durationSeconds: Double,
+    val downloadMillis: Long,
+    val reachedManifestEdge: Boolean,
 )
 
 class LiveProtocolException(message: String, cause: Throwable? = null) :
     IllegalArgumentException(message, cause)
+
+class LiveInitializationChangedException(
+    val previous: LiveCodecInit,
+    val current: LiveCodecInit,
+) : Exception("Live codec initialization changed")
 
 object LiveManifestParser {
     fun parse(json: String, manifestUrl: String): LiveManifest = try {
@@ -167,19 +190,16 @@ class LiveSequenceTracker {
 
     fun select(manifest: LiveManifest): LiveSegmentInfo? {
         if (manifest.segments.isEmpty()) return null
-        val safeEdgeIndex = (manifest.segments.lastIndex - LIVE_EDGE_OFFSET).coerceAtLeast(0)
+        val safeEdgeIndex = manifest.segments.lastIndex
         val safeEdge = manifest.segments[safeEdgeIndex]
         val expected = nextSequence
         if (expected == null || expected < manifest.segments.first().sequence) {
-            // Begin far enough behind the protected live edge to download the
-            // complete startup cushion from the current manifest immediately.
+            // Begin far enough behind the published edge to download the
+            // complete startup cushion from this one manifest response.
             val startupIndex = (safeEdgeIndex - (STARTUP_BUFFER_SEGMENTS - 1))
                 .coerceAtLeast(0)
             return manifest.segments[startupIndex]
         }
-        // Do not consume the newest published entries. A fast downloader used
-        // to race through the cached manifest and then wait directly at its
-        // live edge, leaving no publication-time cushion for AudioTrack.
         return manifest.segments
             .take(safeEdgeIndex + 1)
             .firstOrNull { it.sequence >= expected }
@@ -203,8 +223,7 @@ class LiveSequenceTracker {
     internal fun expectedSequence(): Long? = nextSequence
 
     private companion object {
-        const val LIVE_EDGE_OFFSET = 2
-        const val STARTUP_BUFFER_SEGMENTS = 3
+        const val STARTUP_BUFFER_SEGMENTS = 6
     }
 }
 
@@ -217,6 +236,7 @@ class LiveStreamSource(
             LiveManifestParser.MAX_MANIFEST_BYTES,
             noCache = true,
             dispatcher = networkDispatcher,
+            acceptGzip = true,
         )
     },
     private val fetchSegmentBytes: suspend (String) -> ByteArray = { url ->
@@ -244,6 +264,8 @@ class LiveStreamSource(
                 return manifest.init
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (changed: LiveInitializationChangedException) {
+                throw changed
             } catch (protocol: LiveProtocolException) {
                 throw protocol
             } catch (error: IOException) {
@@ -274,13 +296,25 @@ class LiveStreamSource(
                     continue
                 }
                 onStatus("Buffering segment ${selected.sequence}…")
+                val downloadStarted = LiveDiagnostics.nowMs()
+                LiveDiagnostics.info(
+                    "segment request seq=${selected.sequence} expectedBytes=${selected.byteLength} " +
+                        "thread=${Thread.currentThread().name}",
+                )
                 val bytes = fetchSegmentBytes(selected.url)
+                val downloadMs = LiveDiagnostics.nowMs() - downloadStarted
                 verifySegment(bytes, selected, activeManifest.init)
                 val accepted = tracker.accept(selected)
+                LiveDiagnostics.info(
+                    "segment ready seq=${selected.sequence} bytes=${bytes.size} downloadMs=$downloadMs " +
+                        "discontinuity=${accepted.discontinuity}",
+                )
                 retryCount = 0
                 return DownloadedLiveSegment(
                     bytes, selected.sequence, accepted.discontinuity,
                     activeManifest.init.codebooks, activeManifest.init.bandwidthKbps,
+                    selected.duration, downloadMs,
+                    selected.sequence == activeManifest.segments.lastOrNull()?.sequence,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -288,6 +322,10 @@ class LiveStreamSource(
                 throw protocol
             } catch (error: IOException) {
                 retryCount++
+                LiveDiagnostics.warn(
+                    "network retry=$retryCount expectedSeq=${tracker.expectedSequence()} " +
+                        "error=${error.message}",
+                )
                 onStatus("Network error: ${error.message ?: "retrying"}")
                 delay(min(5_000L, 500L * retryCount))
             }
@@ -303,20 +341,33 @@ class LiveStreamSource(
     }
 
     private fun pollDelayMillis(manifest: LiveManifest): Long =
-        (manifest.targetDuration * 250).toLong().coerceIn(250L, 1_000L)
+        (manifest.targetDuration * 750).toLong().coerceIn(1_000L, 4_000L)
 
     private suspend fun fetchAndCacheManifest(): LiveManifest {
+        val fetchStarted = LiveDiagnostics.nowMs()
+        LiveDiagnostics.info(
+            "manifest request expectedSeq=${tracker.expectedSequence()} " +
+                "thread=${Thread.currentThread().name}",
+        )
+        val manifestBytes = fetchManifestBytes()
         val manifest = LiveManifestParser.parse(
-            fetchManifestBytes().toString(Charsets.UTF_8),
+            manifestBytes.toString(Charsets.UTF_8),
             manifestUrl,
         )
         val expectedInit = streamInit
         if (expectedInit != null && manifest.init != expectedInit) {
-            throw LiveProtocolException("Live codec initialization changed")
+            throw LiveInitializationChangedException(expectedInit, manifest.init)
         }
         streamInit = manifest.init
         streamTitle = manifest.title
         cachedManifest = manifest
+        val first = manifest.segments.firstOrNull()?.sequence
+        val last = manifest.segments.lastOrNull()?.sequence
+        LiveDiagnostics.info(
+            "manifest ready bytes=${manifestBytes.size} fetchMs=" +
+                "${LiveDiagnostics.nowMs() - fetchStarted} range=$first..$last " +
+                "mediaSeq=${manifest.mediaSequence} targetSec=${manifest.targetDuration}",
+        )
         return manifest
     }
 

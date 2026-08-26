@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
+import android.util.Log
 import com.henry.encodec.decoder.DecodedPcm
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -12,6 +13,7 @@ import kotlin.math.roundToInt
 class AudioTrackSink(
     val sampleRate: Int,
     val channels: Int,
+    private val diagnosticsEnabled: () -> Boolean = { false },
 ) : AutoCloseable {
     private var framesWritten = 0L
     private val channelMask = if (channels == 1) {
@@ -22,6 +24,21 @@ class AudioTrackSink(
     private val createdTrack = createCompatibleTrack()
     private val track = createdTrack.track
     private val encoding = createdTrack.encoding
+
+    init {
+        val bufferFrames = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            track.bufferSizeInFrames
+        } else {
+            -1
+        }
+        if (diagnosticsEnabled()) {
+            Log.i(
+                "EnCodecLive",
+                "AudioTrack created sampleRate=$sampleRate channels=$channels encoding=$encoding " +
+                    "bufferFrames=$bufferFrames sessionId=${track.audioSessionId}",
+            )
+        }
+    }
 
     @Synchronized
     fun start() = track.play()

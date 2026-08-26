@@ -65,11 +65,10 @@ class EcdcPlaybackSession(
                         reader.readFrame() ?: return@withContext
                     }
 
-                    // Two UI position updates per second are smooth enough for
-                    // the seek bar and avoid recomposing the complete player at
-                    // the former 10 Hz rate while native decoding is active.
+                    // One UI position update per second is enough for the seek
+                    // bar and avoids unnecessary work during locked-screen playback.
                     val progressIntervalSamples =
-                        (reader.header.variant.sampleRate / 2).coerceAtLeast(1).toLong()
+                        reader.header.variant.sampleRate.coerceAtLeast(1).toLong()
                     var lastReportedSample = requestedStart - progressIntervalSamples
                     fun reportPlayedPosition(force: Boolean = false) {
                         val playedSample = (requestedStart + sink.playedFrames())

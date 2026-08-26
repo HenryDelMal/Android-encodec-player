@@ -1,5 +1,6 @@
 package com.henry.encodec.playback
 
+import android.util.Log
 import com.henry.encodec.decoder.DecodedPcm
 import com.henry.encodec.decoder.EncodecDecoder
 import com.henry.encodec.ecdc.EcdcReader
@@ -22,6 +23,7 @@ data class LiveEcdcSegment(
 class LiveEcdcPlaybackSession(
     private val decoder: EncodecDecoder,
     private val sharedSink: AudioTrackSink? = null,
+    private val diagnosticsEnabled: () -> Boolean = { false },
 ) {
     @Volatile private var currentSink: AudioTrackSink? = null
     @Volatile private var paused = false
@@ -60,7 +62,7 @@ class LiveEcdcPlaybackSession(
                 val initialSegment = nextSegment()
                 sink.flushQueued()
                 var started = false
-                initialSegment.input.use { input ->
+                val initialStats = initialSegment.input.use { input ->
                     decode(input) { pcm ->
                         if (stopRequested) return@decode false
                         if (!started) {
@@ -71,6 +73,7 @@ class LiveEcdcPlaybackSession(
                         write(sink, pcm)
                     }
                 }
+                logSegment(initialSegment.sequence, initialStats, sink)
                 if (!started || stopRequested) return@withContext
                 if (!stopRequested) onSegmentPlaying(initialSegment.sequence)
                 while (!stopRequested) {
@@ -80,7 +83,8 @@ class LiveEcdcPlaybackSession(
                         sink.flushQueued()
                         if (!paused) sink.resume()
                     }
-                    segment.input.use { decodeAndWrite(it, sink) }
+                    val stats = segment.input.use { decodeAndWrite(it, sink) }
+                    logSegment(segment.sequence, stats, sink)
                     if (!stopRequested) onSegmentPlaying(segment.sequence)
                 }
             } finally {
@@ -91,11 +95,19 @@ class LiveEcdcPlaybackSession(
         }
     }
 
-    private fun decodeAndWrite(input: InputStream, sink: AudioTrackSink) {
+    private fun decodeAndWrite(input: InputStream, sink: AudioTrackSink): SegmentStats =
         decode(input) { write(sink, it) }
-    }
 
-    private fun decode(input: InputStream, emit: (DecodedPcm) -> Boolean) {
+    private fun decode(input: InputStream, emit: (DecodedPcm) -> Boolean): SegmentStats {
+        val wallStarted = System.nanoTime()
+        var decodeNanos = 0L
+        var writeNanos = 0L
+        var decodedFrames = 0L
+        var codecFrames = 0
+        fun timedEmit(pcm: DecodedPcm): Boolean {
+            val started = System.nanoTime()
+            return emit(pcm).also { writeNanos += System.nanoTime() - started }
+        }
         EcdcReader(input).use { reader ->
             require(reader.header.variant == decoder.variant) {
                 "Live segment uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
@@ -109,24 +121,28 @@ class LiveEcdcPlaybackSession(
             var pendingTail: DecodedPcm? = null
             while (!stopRequested) {
                 val frame = reader.readFrame() ?: break
+                val decodeStarted = System.nanoTime()
                 val pcm = decoder.decode(frame)
+                decodeNanos += System.nanoTime() - decodeStarted
+                decodedFrames += pcm.frameCount
+                codecFrames++
                 if (overlapSamples == 0) {
-                    if (!emit(pcm)) return
+                    if (!timedEmit(pcm)) break
                     emittedSamples += pcm.frameCount
                     continue
                 }
                 val previousTail = pendingTail
                 if (previousTail == null) {
                     val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(0)
-                    if (bodyEnd > 0 && !emit(pcm.sliceFrames(0, bodyEnd))) return
+                    if (bodyEnd > 0 && !timedEmit(pcm.sliceFrames(0, bodyEnd))) break
                     emittedSamples += bodyEnd
                     pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 } else {
                     val overlap = minOf(overlapSamples, previousTail.frameCount, pcm.frameCount)
-                    if (overlap > 0 && !emit(crossfade(previousTail, pcm, overlap))) return
+                    if (overlap > 0 && !timedEmit(crossfade(previousTail, pcm, overlap))) break
                     emittedSamples += overlap
                     val bodyEnd = (pcm.frameCount - overlapSamples).coerceAtLeast(overlap)
-                    if (bodyEnd > overlap && !emit(pcm.sliceFrames(overlap, bodyEnd))) return
+                    if (bodyEnd > overlap && !timedEmit(pcm.sliceFrames(overlap, bodyEnd))) break
                     emittedSamples += bodyEnd - overlap
                     pendingTail = pcm.sliceFrames(bodyEnd, pcm.frameCount)
                 }
@@ -134,8 +150,28 @@ class LiveEcdcPlaybackSession(
             pendingTail?.let { last ->
                 val remaining = (reader.header.audioLengthSamples - emittedSamples)
                     .coerceAtMost(last.frameCount.toLong()).toInt()
-                if (!stopRequested && remaining > 0) emit(last.sliceFrames(0, remaining))
+                if (!stopRequested && remaining > 0) timedEmit(last.sliceFrames(0, remaining))
             }
+        }
+        return SegmentStats(
+            wallMs = (System.nanoTime() - wallStarted) / 1_000_000L,
+            decodeMs = decodeNanos / 1_000_000,
+            writeMs = writeNanos / 1_000_000,
+            decodedFrames = decodedFrames,
+            codecFrames = codecFrames,
+        )
+    }
+
+    private fun logSegment(sequence: Long, stats: SegmentStats, sink: AudioTrackSink) {
+        if (!diagnosticsEnabled()) return
+        val audioMs = stats.decodedFrames * 1_000L / decoder.variant.sampleRate
+        runCatching {
+            Log.i(
+                LIVE_LOG_TAG,
+                "play segment seq=$sequence codecFrames=${stats.codecFrames} audioMs=$audioMs " +
+                    "wallMs=${stats.wallMs} decodeMs=${stats.decodeMs} writeMs=${stats.writeMs} " +
+                    "playedFrames=${sink.playedFrames()} thread=${Thread.currentThread().name}",
+            )
         }
     }
 
@@ -143,6 +179,14 @@ class LiveEcdcPlaybackSession(
         sink.write(pcm, shouldStop = { stopRequested })
 
     private val DecodedPcm.frameCount: Int get() = samples.size / channels
+
+    private data class SegmentStats(
+        val wallMs: Long,
+        val decodeMs: Long,
+        val writeMs: Long,
+        val decodedFrames: Long,
+        val codecFrames: Int,
+    )
 
     private fun DecodedPcm.sliceFrames(from: Int, until: Int): DecodedPcm =
         copy(samples = samples.copyOfRange(from * channels, until * channels))
@@ -162,5 +206,9 @@ class LiveEcdcPlaybackSession(
             }
         }
         return DecodedPcm(mixed, left.sampleRate, channels)
+    }
+
+    private companion object {
+        const val LIVE_LOG_TAG = "EnCodecLive"
     }
 }

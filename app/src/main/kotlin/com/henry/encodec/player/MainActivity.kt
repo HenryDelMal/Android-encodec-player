@@ -399,6 +399,10 @@ private fun PlayerScreen(model: PlayerViewModel) {
         }
 
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+
+        TextButton(onClick = model::toggleDiagnostics) {
+            Text(if (state.diagnosticsEnabled) "Diagnostics: On" else "Diagnostics: Off")
+        }
     }
 
     if (showUrlDialog) {
