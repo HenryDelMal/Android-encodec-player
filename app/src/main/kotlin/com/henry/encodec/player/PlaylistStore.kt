@@ -68,6 +68,7 @@ class PlaylistStore(context: Context) {
             repeatMode = repeatMode,
             diagnosticsEnabled = root.optBoolean("diagnosticsEnabled", false),
             experimentalVocos = root.optBoolean("experimentalVocos", false),
+            rescaleEnabled = root.optBoolean("rescaleEnabled", false),
         )
     }.getOrElse { PlayerState() }
 
@@ -106,6 +107,7 @@ class PlaylistStore(context: Context) {
             .put("repeatMode", state.repeatMode.name)
             .put("diagnosticsEnabled", state.diagnosticsEnabled)
             .put("experimentalVocos", state.experimentalVocos)
+            .put("rescaleEnabled", state.rescaleEnabled)
         preferences.edit().putString(PLAYLIST_KEY, root.toString()).apply()
     }
 

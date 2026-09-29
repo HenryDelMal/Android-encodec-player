@@ -584,6 +584,16 @@ private fun SettingsPage(
                     onChecked = model::setExperimentalVocos,
                 )
                 SettingsToggle("Playback diagnostics", "Extra decoder and stream logs", state.diagnosticsEnabled) { model.toggleDiagnostics() }
+                SettingsToggle(
+                    title = "Rescale decoded audio",
+                    subtitle = if (state.rescaleEnabled) {
+                        "Peak level is limited to prevent clipping"
+                    } else {
+                        "Off · preserve the decoder's original level"
+                    },
+                    checked = state.rescaleEnabled,
+                    onChecked = model::setRescaleEnabled,
+                )
             }
             "Network" -> SettingsInfo("Live streams refresh their manifest as needed and buffer ahead based on connection performance.")
             "Library" -> {

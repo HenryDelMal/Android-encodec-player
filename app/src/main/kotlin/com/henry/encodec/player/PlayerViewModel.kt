@@ -107,6 +107,7 @@ data class PlayerState(
     val error: String? = null,
     val diagnosticsEnabled: Boolean = false,
     val experimentalVocos: Boolean = false,
+    val rescaleEnabled: Boolean = false,
 ) {
     val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
 }
@@ -635,6 +636,23 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         persistPlaylist()
     }
 
+    fun setRescaleEnabled(enabled: Boolean) {
+        val snapshot = mutableState.value
+        if (snapshot.rescaleEnabled == enabled) return
+        mutableState.value = snapshot.copy(rescaleEnabled = enabled)
+        persistPlaylist()
+        if (snapshot.playing) {
+            if (snapshot.live != null) {
+                startLivePlayback()
+            } else {
+                requestedStartSample = snapshot.current?.let {
+                    (it.header.audioLengthSamples * snapshot.progress).toLong()
+                } ?: 0L
+                startPlayback(startPaused = snapshot.paused)
+            }
+        }
+    }
+
     fun setExperimentalVocos(enabled: Boolean) {
         val snapshot = mutableState.value
         if (snapshot.experimentalVocos == enabled) return
@@ -684,6 +702,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             repeatMode = snapshot.repeatMode,
             diagnosticsEnabled = snapshot.diagnosticsEnabled,
             experimentalVocos = snapshot.experimentalVocos,
+            rescaleEnabled = snapshot.rescaleEnabled,
         )
         persistPlaylist()
     }
@@ -1645,12 +1664,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private fun decoderConfig(variant: EncodecVariant, codebooks: Int): DecoderConfig = when (variant) {
         EncodecVariant.STEREO_48_KHZ -> DecoderConfig(
             assetName = "encodec-decoder-48khz-f32.bin",
+            rescale = mutableState.value.rescaleEnabled,
         )
         EncodecVariant.MONO_24_KHZ -> {
             val vocos = mutableState.value.experimentalVocos && codebooks in setOf(2, 4, 8, 16)
             DecoderConfig(
                 assetName = if (vocos) "vocos-encodec-24khz-f32.bin" else "encodec-decoder-24khz-f32.bin",
                 vocos = vocos,
+                rescale = mutableState.value.rescaleEnabled,
             )
         }
     }
@@ -1658,6 +1679,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private data class DecoderConfig(
         val assetName: String,
         val vocos: Boolean = false,
+        val rescale: Boolean = false,
     )
 
     /** Keep only one native model resident; variant changes trade a reload for much lower RAM use. */
@@ -1665,16 +1687,26 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         config: DecoderConfig,
         variant: EncodecVariant,
     ): EncodecDecoder {
-        cachedDecoder?.takeIf { it.variant == variant && (it is VocosDecoder) == config.vocos }?.let { return it }
+        cachedDecoder?.takeIf {
+            it.variant == variant &&
+                (it is VocosDecoder) == config.vocos &&
+                when (it) {
+                    is CppEncodecDecoder -> it.rescale == config.rescale
+                    is VocosDecoder -> it.rescale == config.rescale
+                    else -> false
+                }
+        }?.let { return it }
         cachedDecoder?.close()
         cachedDecoder = null
         val decoder = if (config.vocos) VocosDecoder(
             copyAssetOnce(config.assetName),
             getApplication<Application>(),
+            rescale = config.rescale,
             diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
         ) else CppEncodecDecoder(
             copyAssetOnce(config.assetName),
             variant,
+            rescale = config.rescale,
             context = getApplication<Application>(),
             diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
         )
