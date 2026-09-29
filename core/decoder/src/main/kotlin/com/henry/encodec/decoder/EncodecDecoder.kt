@@ -12,6 +12,7 @@ data class DecodedPcm(
 
 interface EncodecDecoder : AutoCloseable {
     val variant: EncodecVariant
+    val rightContextTimeSteps: Int get() = 0
     fun decode(frame: EcdcFrame): DecodedPcm
 }
 

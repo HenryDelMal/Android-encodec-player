@@ -13,7 +13,7 @@ import java.io.File
 class CppEncodecDecoder(
     modelFile: File,
     override val variant: EncodecVariant,
-    private val rescale: Boolean = true,
+    val rescale: Boolean = false,
     context: Context? = null,
     private val diagnosticsEnabled: () -> Boolean = { false },
 ) : EncodecDecoder {
@@ -88,7 +88,7 @@ class CppEncodecDecoder(
     }
 }
 
-private class DecoderPowerHint(context: Context) : AutoCloseable {
+internal class DecoderPowerHint(context: Context) : AutoCloseable {
     private val manager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         context.getSystemService(PerformanceHintManager::class.java)
     } else {

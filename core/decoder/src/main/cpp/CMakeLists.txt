@@ -6,6 +6,8 @@ add_library(
     SHARED
     encodec_jni.cpp
     encodec/encodec.cpp
+    vocos_jni.cpp
+    vocos/vocos.cpp
 )
 
 target_compile_features(encodec_android PRIVATE cxx_std_20)
@@ -14,6 +16,7 @@ target_include_directories(
     encodec_android
     PRIVATE
     encodec
+    vocos
     third_party/eigen
 )
 
@@ -25,3 +28,8 @@ target_compile_options(
 )
 target_link_options(encodec_android PRIVATE -Wl,--gc-sections)
 target_link_libraries(encodec_android PRIVATE android log)
+
+# Retain finite-value validation of checkpoint tensors and Vocos PCM even
+# though the existing native target uses fast math for its neural hot path.
+set_source_files_properties(vocos_jni.cpp vocos/vocos.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-finite-math-only")

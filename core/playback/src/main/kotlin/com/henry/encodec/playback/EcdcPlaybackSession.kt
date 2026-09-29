@@ -5,6 +5,11 @@ import com.henry.encodec.decoder.EncodecDecoder
 import com.henry.encodec.ecdc.EcdcReader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import kotlin.coroutines.coroutineContext
@@ -40,7 +45,7 @@ class EcdcPlaybackSession(
         initialFrameIndex: Int = 0,
         onProgress: (Float) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        EcdcReader(input, initialFrameIndex).use { reader ->
+        EcdcReader(input, initialFrameIndex, decoder.rightContextTimeSteps).use { reader ->
             require(reader.header.variant == decoder.variant) {
                 "File uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
             }
@@ -65,8 +70,8 @@ class EcdcPlaybackSession(
                         reader.readFrame() ?: return@withContext
                     }
 
-                    // One UI position update per second is enough for the seek
-                    // bar and avoids unnecessary work during locked-screen playback.
+                    // Poll the playback head on a wall-clock cadence so UI
+                    // position does not inherit decoder-frame or write batching.
                     val progressIntervalSamples =
                         reader.header.variant.sampleRate.coerceAtLeast(1).toLong()
                     var lastReportedSample = requestedStart - progressIntervalSamples
@@ -81,10 +86,15 @@ class EcdcPlaybackSession(
                             )
                         }
                     }
+                    val progressJob = CoroutineScope(coroutineContext).launch {
+                        while (isActive && !stopRequested) {
+                            delay(1_000)
+                            reportPlayedPosition()
+                        }
+                    }
                     fun writeToSink(pcm: DecodedPcm): Boolean = sink.write(
                         pcm = pcm,
                         shouldStop = { stopRequested },
-                        onPlaybackAdvanced = { reportPlayedPosition() },
                     )
 
                     var emittedSamples = requestedStart
@@ -95,66 +105,69 @@ class EcdcPlaybackSession(
                     val overlapSamples = reader.header.variant.segmentSamples
                         ?.minus(reader.header.variant.segmentStrideSamples ?: 0)
                         ?: 0
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        if (stopRequested) break
-                        val frame = reader.readFrame() ?: break
-                        var pcm = decoder.decode(frame)
-                        if (firstFrame) {
-                            val trim = (requestedStart - frame.outputOffsetSamples)
-                                .coerceIn(0, (pcm.samples.size / pcm.channels).toLong())
-                                .toInt()
-                            if (trim > 0) {
-                                pcm = pcm.sliceFrames(trim, pcm.samples.size / pcm.channels)
+                    try {
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            if (stopRequested) break
+                            val frame = reader.readFrame() ?: break
+                            var pcm = decoder.decode(frame)
+                            if (firstFrame) {
+                                val trim = (requestedStart - frame.outputOffsetSamples)
+                                    .coerceIn(0, (pcm.samples.size / pcm.channels).toLong())
+                                    .toInt()
+                                if (trim > 0) {
+                                    pcm = pcm.sliceFrames(trim, pcm.samples.size / pcm.channels)
+                                }
+                                firstFrame = false
                             }
-                            firstFrame = false
-                        }
-                        if (overlapSamples == 0) {
+                            if (overlapSamples == 0) {
+                                val pcmFrames = pcm.samples.size / pcm.channels
+                                if (!writeToSink(pcm)) break
+                                emittedSamples += pcmFrames
+                                continue
+                            }
                             val pcmFrames = pcm.samples.size / pcm.channels
-                            if (!writeToSink(pcm)) break
-                            emittedSamples += pcmFrames
-                            continue
-                        }
-                        val pcmFrames = pcm.samples.size / pcm.channels
-                        val previousTail = pendingTail
-                        if (previousTail == null) {
-                            val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(0)
-                            if (bodyEnd > 0) {
-                                if (!writeToSink(pcm.sliceFrames(0, bodyEnd))) break
-                                emittedSamples += bodyEnd
+                            val previousTail = pendingTail
+                            if (previousTail == null) {
+                                val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(0)
+                                if (bodyEnd > 0) {
+                                    if (!writeToSink(pcm.sliceFrames(0, bodyEnd))) break
+                                    emittedSamples += bodyEnd
+                                }
+                                pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
+                            } else {
+                                val overlap = minOf(
+                                    overlapSamples,
+                                    previousTail.samples.size / previousTail.channels,
+                                    pcmFrames,
+                                )
+                                if (overlap > 0) {
+                                    if (!writeToSink(crossfade(previousTail, pcm, overlap))) break
+                                    emittedSamples += overlap
+                                }
+                                val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(overlap)
+                                if (bodyEnd > overlap) {
+                                    if (!writeToSink(pcm.sliceFrames(overlap, bodyEnd))) break
+                                    emittedSamples += bodyEnd - overlap
+                                }
+                                pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
                             }
-                            pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
-                        } else {
-                            val overlap = minOf(
-                                overlapSamples,
-                                previousTail.samples.size / previousTail.channels,
-                                pcmFrames,
-                            )
-                            if (overlap > 0) {
-                                if (!writeToSink(crossfade(previousTail, pcm, overlap))) break
-                                emittedSamples += overlap
-                            }
-                            val bodyEnd = (pcmFrames - overlapSamples).coerceAtLeast(overlap)
-                            if (bodyEnd > overlap) {
-                                if (!writeToSink(pcm.sliceFrames(overlap, bodyEnd))) break
-                                emittedSamples += bodyEnd - overlap
-                            }
-                            pendingTail = pcm.sliceFrames(bodyEnd, pcmFrames)
                         }
-                    }
-                    pendingTail?.let { last ->
-                        val remaining = (reader.header.audioLengthSamples - emittedSamples)
-                            .coerceAtMost(last.samples.size.toLong() / last.channels)
-                            .toInt()
-                        if (!stopRequested && remaining > 0) {
-                            writeToSink(last.sliceFrames(0, remaining))
+                        pendingTail?.let { last ->
+                            val remaining = (reader.header.audioLengthSamples - emittedSamples)
+                                .coerceAtMost(last.samples.size.toLong() / last.channels)
+                                .toInt()
+                            if (!stopRequested && remaining > 0) {
+                                writeToSink(last.sliceFrames(0, remaining))
+                            }
                         }
+                        if (!stopRequested) {
+                            sink.drain(shouldStop = { stopRequested })
+                        }
+                    } finally {
+                        progressJob.cancelAndJoin()
                     }
                     if (!stopRequested) {
-                        sink.drain(
-                            shouldStop = { stopRequested },
-                            onPlaybackAdvanced = { reportPlayedPosition() },
-                        )
                         reportPlayedPosition(force = true)
                     }
                 } finally {

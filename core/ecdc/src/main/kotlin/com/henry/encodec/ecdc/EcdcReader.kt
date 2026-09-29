@@ -7,7 +7,8 @@ import java.nio.charset.StandardCharsets
 import kotlin.math.ceil
 import kotlin.math.min
 
-class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable {
+class EcdcReader(input: InputStream, initialFrameIndex: Int = 0, private val rightContextTimeSteps: Int = 0) : AutoCloseable {
+    init { require(rightContextTimeSteps in 0..75) }
     private val source = DataInputStream(BufferedInputStream(input))
     val header: EcdcHeader = readHeader(source)
     private val frameCount = frameCount(header)
@@ -20,6 +21,7 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
         null
     }
     private var monoContextCodes = IntArray(0)
+    private var monoPendingCodes = IntArray(0)
 
     fun readFrame(): EcdcFrame? {
         if (framesRead >= frameCount) return null
@@ -81,7 +83,9 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
         ).toInt()
         val newCodes = IntArray(newTimeSteps * header.numCodebooks)
         val bits = requireNotNull(monoBits)
-        for (time in 0 until newTimeSteps) {
+        val pendingSteps = min(monoPendingCodes.size / header.numCodebooks, newTimeSteps)
+        monoPendingCodes.copyInto(newCodes, endIndex = pendingSteps * header.numCodebooks)
+        for (time in pendingSteps until newTimeSteps) {
             for (codebook in 0 until header.numCodebooks) {
                 newCodes[time * header.numCodebooks + codebook] = bits.pull()
                     ?: throw EcdcFormatException("Code stream ended in mono chunk $framesRead")
@@ -89,7 +93,14 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
         }
 
         val contextTimeSteps = monoContextCodes.size / header.numCodebooks
-        val combined = monoContextCodes + newCodes
+        val remainingSamples = header.audioLengthSamples - outputOffset - outputLength
+        val aheadSteps = min(rightContextTimeSteps, ceil(remainingSamples / 320.0).toInt())
+        val ahead = IntArray(aheadSteps * header.numCodebooks)
+        for (index in ahead.indices) {
+            ahead[index] = bits.pull() ?: throw EcdcFormatException("Code stream ended in mono look-ahead")
+        }
+        monoPendingCodes = ahead
+        val combined = monoContextCodes + newCodes + ahead
         val retainedTimeSteps = min(MONO_CONTEXT_TIME_STEPS, newTimeSteps)
         monoContextCodes = newCodes.copyOfRange(
             (newTimeSteps - retainedTimeSteps) * header.numCodebooks,
@@ -98,7 +109,7 @@ class EcdcReader(input: InputStream, initialFrameIndex: Int = 0) : AutoCloseable
 
         return EcdcFrame(
             codebookCount = header.numCodebooks,
-            timeSteps = contextTimeSteps + newTimeSteps,
+            timeSteps = contextTimeSteps + newTimeSteps + aheadSteps,
             codes = combined,
             scale = null,
             outputOffsetSamples = outputOffset,

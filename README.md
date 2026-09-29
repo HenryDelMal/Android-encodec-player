@@ -34,6 +34,9 @@ Language-model entropy coding is not supported for either variant.
 
 ## Features
 
+- Optional experimental Vocos decoding of existing 24 kHz EnCodec tokens at
+  1.5, 3, 6 and 12 kbps, for both files and independent live segments.
+
 - Local `.ecdc` file picker.
 - Persistent playlist with play, pause, stop, previous, next, and seeking.
 - Separate persistent saved-livestream library with per-entry removal and a
@@ -42,7 +45,7 @@ Language-model entropy coding is not supported for either variant.
   when a track ends.
 - Shuffle and loop modes for one track or the whole playlist.
 - Per-track removal and a Delete all control.
-- Foreground playback with CPU and Wi-Fi wake locks for reliable playback while
+- Foreground playback with a partial CPU wake lock for reliable playback while
   the screen is locked.
 - Automatic retry for temporary DNS and connection failures when opening a
   remote stream.
@@ -75,6 +78,42 @@ Language-model entropy coding is not supported for either variant.
   segment boundaries.
 
 Static URL seeking requires an HTTP server that honors byte-range requests.
+
+## Experimental Vocos decoder
+
+Tap **24 kHz decoder: EnCodec** to select **Vocos (experimental)**. The choice
+persists between sessions. Switching during playback restarts a file at the
+current position or reconnects the livestream. Supported inputs are official
+24 kHz mono EnCodec ECDC tokens with 2, 4, 8 or 16 codebooks (1.5–12 kbps).
+48 kHz stereo and 32-codebook 24 kbps files automatically use EnCodec.
+
+The APK bundles the official
+[charactr/vocos-encodec-24khz](https://huggingface.co/charactr/vocos-encodec-24khz)
+checkpoint. The native C++/Eigen decoder runs on one inference thread and
+implements bandwidth-conditioned LayerNorm, ConvNeXt, and inverse-STFT.
+It consumes the existing EnCodec tokens; no encoder or container change is
+required. Output peaks above 0.99 are rescaled. Its noncausal convolutions need
+32 future token frames (about 427 ms) of bounded context at internal file chunk
+boundaries. Independent live segments retain the existing boundary correction.
+
+The decoder is experimental: sound, startup time, memory, and battery use should
+be compared on actual phones. EnCodec is the default. The desktop native path
+is checked against the official Vocos PyTorch implementation at all supported
+bitrates, including one-frame inputs and chunk-context parity.
+
+To regenerate the bundled model, download `pytorch_model.bin` from the model
+repository above, install `torch` and `numpy`, then run from the project root:
+
+```sh
+python tools/export_vocos.py /path/to/pytorch_model.bin \
+  app/src/main/assets/vocos-encodec-24khz-f32.bin
+```
+
+The exporter refuses to overwrite an existing output. The checkpoint used here
+has SHA-256 `7e95bb260b74a1bfc43c52d355831c951acb81c8960e9c62b79bd2b3ab1e3a90`.
+It includes the official codebook embeddings; no separate EnCodec checkpoint
+is needed for Vocos inference. See `tools/check_vocos_parity.py` and
+`tools/vocos_fixture.cpp` for reproducible numerical verification.
 
 ## Playing an EnCodec livestream
 

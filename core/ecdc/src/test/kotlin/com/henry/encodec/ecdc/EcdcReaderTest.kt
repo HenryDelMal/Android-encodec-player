@@ -107,6 +107,51 @@ class EcdcReaderTest {
         }
     }
 
+    @Test
+    fun `vocos lookahead preserves tokens and output timeline including short final chunk`() {
+        for (length in listOf(120_000, 192_013)) {
+            val books = 4
+            val codes = IntArray(((length + 319) / 320) * books) { (it * 31) % 1024 }
+            val bytes = file("encodec_24khz", length, books, false, codes)
+            EcdcReader(ByteArrayInputStream(bytes), rightContextTimeSteps = 32).use { reader ->
+                var offset = 0
+                while (offset < length) {
+                    val frame = requireNotNull(reader.readFrame())
+                    val history = if (offset == 0) 0 else 75
+                    val samples = minOf(96_000, length - offset)
+                    val outputSteps = (samples + 319) / 320
+                    val ahead = minOf(32, (length - offset - samples + 319) / 320)
+                    val firstStep = offset / 320 - history
+                    assertEquals(offset.toLong(), frame.outputOffsetSamples)
+                    assertEquals(samples, frame.outputLengthSamples)
+                    assertEquals(history * 320, frame.trimLeadingSamples)
+                    assertEquals(history + outputSteps + ahead, frame.timeSteps)
+                    assertContentEquals(codes.copyOfRange(firstStep * books,
+                        (firstStep + frame.timeSteps) * books), frame.codes)
+                    offset += samples
+                }
+                assertEquals(null, reader.readFrame())
+            }
+        }
+    }
+
+    @Test
+    fun `vocos lookahead works after direct mono seek`() {
+        val books = 2
+        val codes = IntArray(900 * books) { it % 1024 }
+        val bytes = file("encodec_24khz", 288_000, books, false, codes)
+        val headerBytes = EcdcReader.readHeaderBytes(ByteArrayInputStream(bytes))
+        val header = EcdcReader.inspect(ByteArrayInputStream(headerBytes))
+        val byteOffset = EcdcReader.monoChunkByteOffset(header, headerBytes.size, 1)
+        val ranged = headerBytes + bytes.copyOfRange(byteOffset.toInt(), bytes.size)
+        EcdcReader(ByteArrayInputStream(ranged), 1, 32).use { reader ->
+            val frame = requireNotNull(reader.readFrame())
+            assertEquals(96_000L, frame.outputOffsetSamples)
+            assertEquals(0, frame.trimLeadingSamples)
+            assertContentEquals(codes.copyOfRange(300 * books, 632 * books), frame.codes)
+        }
+    }
+
     private fun file(model: String, length: Int, codebooks: Int, lm: Boolean, codes: IntArray): ByteArray {
         val metadata = "{\"m\":\"$model\",\"al\":$length,\"nc\":$codebooks,\"lm\":$lm}"
         return ByteArrayOutputStream().also { bytes ->

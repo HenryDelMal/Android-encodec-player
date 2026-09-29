@@ -108,7 +108,7 @@ class LiveEcdcPlaybackSession(
             val started = System.nanoTime()
             return emit(pcm).also { writeNanos += System.nanoTime() - started }
         }
-        EcdcReader(input).use { reader ->
+        EcdcReader(input, rightContextTimeSteps = decoder.rightContextTimeSteps).use { reader ->
             require(reader.header.variant == decoder.variant) {
                 "Live segment uses ${reader.header.variant.wireName}, decoder is ${decoder.variant.wireName}"
             }
