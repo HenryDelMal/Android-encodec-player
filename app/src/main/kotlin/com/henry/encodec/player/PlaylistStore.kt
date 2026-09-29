@@ -67,6 +67,7 @@ class PlaylistStore(context: Context) {
             shuffle = root.optBoolean("shuffle", false),
             repeatMode = repeatMode,
             diagnosticsEnabled = root.optBoolean("diagnosticsEnabled", false),
+            experimentalVocos = root.optBoolean("experimentalVocos", false),
         )
     }.getOrElse { PlayerState() }
 
@@ -104,6 +105,7 @@ class PlaylistStore(context: Context) {
             .put("shuffle", state.shuffle)
             .put("repeatMode", state.repeatMode.name)
             .put("diagnosticsEnabled", state.diagnosticsEnabled)
+            .put("experimentalVocos", state.experimentalVocos)
         preferences.edit().putString(PLAYLIST_KEY, root.toString()).apply()
     }
 

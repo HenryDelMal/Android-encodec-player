@@ -17,6 +17,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.henry.encodec.decoder.CppEncodecDecoder
+import com.henry.encodec.decoder.VocosDecoder
 import com.henry.encodec.decoder.EncodecDecoder
 import com.henry.encodec.ecdc.EcdcHeader
 import com.henry.encodec.ecdc.EcdcReader
@@ -54,6 +55,8 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
 
 data class PlaylistItem(
     val uri: Uri,
@@ -103,6 +106,7 @@ data class PlayerState(
     val live: LiveUiState? = null,
     val error: String? = null,
     val diagnosticsEnabled: Boolean = false,
+    val experimentalVocos: Boolean = false,
 ) {
     val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
 }
@@ -203,6 +207,154 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         )
         persistPlaylist()
         if (selectingFirstTrack) startPlayback()
+    }
+
+    fun importTracks(document: Uri) {
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    val root = resolver.openInputStream(document)?.bufferedReader()?.use { JSONObject(it.readText()) }
+                        ?: error("Could not read the selected file")
+                    require(root.optString("format") == TRACKS_EXPORT_FORMAT) {
+                        "This is not an EnCodec Player tracks export"
+                    }
+                    val entries = root.optJSONArray("tracks") ?: JSONArray()
+                    buildList {
+                        for (index in 0 until entries.length()) {
+                            val entry = entries.optJSONObject(index) ?: continue
+                            val uri = runCatching { Uri.parse(entry.optString("uri")) }.getOrNull() ?: continue
+                            if (uri.scheme.equals("https", true)) {
+                                runCatching {
+                                    val prefix = HttpsStreams.readPrefix(uri.toString(), STATIC_HEADER_PREFIX_BYTES)
+                                    remoteHeaderPrefixes[uri.toString()] = prefix
+                                    ByteArrayInputStream(prefix).use(EcdcReader::inspect)
+                                }.getOrNull()?.let { header ->
+                                    runCatching { validateHeader(header) }.getOrNull()?.let {
+                                        add(PlaylistItem(uri, entry.optString("title").ifBlank { remoteDisplayName(uri) }, header))
+                                    }
+                                }
+                            } else if (uri.scheme.equals("content", true) || uri.scheme.equals("file", true)) {
+                                runCatching {
+                                    resolver.openInputStream(uri)?.use(EcdcReader::inspect)
+                                        ?: error("File is unavailable")
+                                }.getOrNull()?.let { header ->
+                                    runCatching { validateHeader(header) }.getOrNull()?.let {
+                                        add(PlaylistItem(uri, entry.optString("title").ifBlank { displayName(uri) }, header))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            result.onSuccess { imported ->
+                val before = mutableState.value
+                val known = before.playlist.mapTo(mutableSetOf()) { it.uri.toString() }
+                val additions = imported.filter { known.add(it.uri.toString()) }
+                val combined = before.playlist + additions
+                val first = before.currentIndex < 0 && combined.isNotEmpty()
+                if (first) requestedStartSample = 0
+                mutableState.value = before.copy(
+                    playlist = combined,
+                    currentIndex = if (first) 0 else before.currentIndex,
+                    progress = if (first) 0f else before.progress,
+                    error = if (additions.isEmpty()) "No available tracks were imported" else "Imported ${additions.size} track(s)",
+                )
+                additions.forEach { item ->
+                    if (item.uri.scheme.equals("content", true)) runCatching {
+                        getApplication<Application>().contentResolver.takePersistableUriPermission(
+                            item.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }
+                }
+                persistPlaylist()
+                if (first) startPlayback()
+            }.onFailure {
+                mutableState.value = mutableState.value.copy(error = "Import failed: ${it.message}")
+            }
+        }
+    }
+
+    fun importStreams(document: Uri) {
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    val root = resolver.openInputStream(document)?.bufferedReader()?.use { JSONObject(it.readText()) }
+                        ?: error("Could not read the selected file")
+                    require(root.optString("format") == STREAMS_EXPORT_FORMAT) {
+                        "This is not an EnCodec Player livestreams export"
+                    }
+                    val entries = root.optJSONArray("streams") ?: JSONArray()
+                    buildList {
+                        for (index in 0 until entries.length()) {
+                            val item = entries.optJSONObject(index) ?: continue
+                            val url = item.optString("manifestUrl").trim()
+                            val uri = runCatching { Uri.parse(url) }.getOrNull() ?: continue
+                            if (uri.host.isNullOrBlank() || !(uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) ||
+                                !uri.path.orEmpty().endsWith(".json", true)
+                            ) continue
+                            val variant = item.optString("variant").takeIf(String::isNotBlank)
+                                ?.let { runCatching { EncodecVariant.fromWireName(it) }.getOrNull() }
+                            add(SavedLiveStream(
+                                manifestUrl = uri.toString(),
+                                title = item.optString("title").ifBlank { liveDisplayName(uri) },
+                                variant = variant,
+                                codebooks = item.optInt("codebooks", 0).takeIf { it > 0 },
+                                bandwidthKbps = item.optDouble("bandwidthKbps", Double.NaN).takeIf { it.isFinite() },
+                            ))
+                        }
+                    }
+                }
+            }
+            result.onSuccess { imported ->
+                val before = mutableState.value
+                val known = before.livestreams.mapTo(mutableSetOf()) { it.manifestUrl }
+                val additions = imported.filter { known.add(it.manifestUrl) }
+                mutableState.value = before.copy(
+                    livestreams = before.livestreams + additions,
+                    error = if (additions.isEmpty()) "No new livestreams were imported" else "Imported ${additions.size} livestream(s)",
+                )
+                persistPlaylist()
+            }.onFailure {
+                mutableState.value = mutableState.value.copy(error = "Import failed: ${it.message}")
+            }
+        }
+    }
+
+    fun exportTracks(destination: Uri) = exportLibrary(destination, TRACKS_EXPORT_FORMAT) { state ->
+        JSONObject().put("format", TRACKS_EXPORT_FORMAT).put("version", 1).put("tracks", JSONArray().apply {
+            state.playlist.forEach { put(JSONObject().put("uri", it.uri.toString()).put("title", it.title)) }
+        })
+    }
+
+    fun exportStreams(destination: Uri) = exportLibrary(destination, STREAMS_EXPORT_FORMAT) { state ->
+        JSONObject().put("format", STREAMS_EXPORT_FORMAT).put("version", 1).put("streams", JSONArray().apply {
+            state.livestreams.forEach { stream ->
+                put(JSONObject().put("manifestUrl", stream.manifestUrl).put("title", stream.title).apply {
+                    stream.variant?.let { put("variant", it.wireName) }
+                    stream.codebooks?.let { put("codebooks", it) }
+                    stream.bandwidthKbps?.let { put("bandwidthKbps", it) }
+                })
+            }
+        })
+    }
+
+    private fun exportLibrary(destination: Uri, format: String, content: (PlayerState) -> JSONObject) {
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val output = getApplication<Application>().contentResolver.openOutputStream(destination)
+                        ?: error("Could not create the selected file")
+                    output.bufferedWriter().use { it.write(content(mutableState.value).toString(2)) }
+                }
+            }.onSuccess {
+                mutableState.value = mutableState.value.copy(error = "Exported ${if (format == TRACKS_EXPORT_FORMAT) "tracks" else "livestreams"}")
+            }.onFailure {
+                mutableState.value = mutableState.value.copy(error = "Export failed: ${it.message}")
+            }
+        }
     }
 
     fun addUrl(rawUrl: String) {
@@ -483,6 +635,23 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         persistPlaylist()
     }
 
+    fun setExperimentalVocos(enabled: Boolean) {
+        val snapshot = mutableState.value
+        if (snapshot.experimentalVocos == enabled) return
+        mutableState.value = snapshot.copy(experimentalVocos = enabled)
+        persistPlaylist()
+        if (snapshot.playing) {
+            if (snapshot.live != null) {
+                startLivePlayback()
+            } else {
+                requestedStartSample = snapshot.current?.let {
+                    (it.header.audioLengthSamples * snapshot.progress).toLong()
+                } ?: 0L
+                startPlayback(startPaused = snapshot.paused)
+            }
+        }
+    }
+
     fun seekToFraction(fraction: Float) {
         val snapshot = mutableState.value
         if (snapshot.live != null) return
@@ -514,6 +683,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             shuffle = snapshot.shuffle,
             repeatMode = snapshot.repeatMode,
             diagnosticsEnabled = snapshot.diagnosticsEnabled,
+            experimentalVocos = snapshot.experimentalVocos,
         )
         persistPlaylist()
     }
@@ -605,7 +775,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             val cachedVariant = live.variant
                             val cachedDecoder = cachedVariant?.let { variant ->
                                 async(Dispatchers.IO) {
-                                    decoderFor(decoderConfig(variant), variant) to audioSink(variant)
+                                    decoderFor(decoderConfig(variant, live.codebooks ?: 0), variant) to audioSink(variant)
                                 }
                             }
                             val streamInit = source.initialize { status ->
@@ -688,10 +858,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                 }
                             }
                             try {
-                                publishBuffer("Loading decoder…", buffering = true)
-                                val config = decoderConfig(streamInit.variant)
+                                val config = decoderConfig(streamInit.variant, streamInit.codebooks)
+                                publishBuffer(
+                                    if (config.vocos) "Loading Vocos decoder…" else "Loading EnCodec decoder…",
+                                    buffering = true,
+                                )
                                 val decoderStarted = LiveDiagnostics.nowMs()
-                                val (decoder, sink) = if (cachedVariant == streamInit.variant) {
+                                val (decoder, sink) = if (cachedVariant == streamInit.variant && live.codebooks == streamInit.codebooks) {
                                     requireNotNull(cachedDecoder).await()
                                 } else {
                                     cachedDecoder?.await()
@@ -704,7 +877,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                     "decoder ready variant=${streamInit.variant.wireName} " +
                                         "elapsedMs=${LiveDiagnostics.nowMs() - decoderStarted}",
                                 )
-                                publishBuffer("Buffering live audio…", buffering = true)
+                                publishBuffer(
+                                    if (config.vocos) "Vocos ready; buffering live audio…"
+                                    else "EnCodec ready; buffering live audio…",
+                                    buffering = true,
+                                )
+                                val livePlaybackLabel = if (config.vocos) "LIVE · Vocos" else "LIVE"
                                 run {
                                     val newSession = LiveEcdcPlaybackSession(
                                         decoder,
@@ -791,7 +969,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                             if (playbackGeneration == generation) {
                                                 mutableState.value = mutableState.value.copy(
                                                     live = mutableState.value.live?.copy(
-                                                        status = "LIVE",
+                                                    status = livePlaybackLabel,
                                                         sequence = sequence,
                                                         bufferedSegments = buffered.get(),
                                                         targetBufferedSegments = targetBuffer.get(),
@@ -882,7 +1060,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             0L
                         }
                         firstIteration = false
-                        val config = decoderConfig(item.header.variant)
+                        val config = decoderConfig(item.header.variant, item.header.numCodebooks)
                         val preparedRemote = if (item.uri.scheme.equals("https", true)) {
                             playbackScope.async(Dispatchers.IO) {
                                 prepareRemoteInput(
@@ -1203,6 +1381,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         private const val LIVE_PREFETCH_CAPACITY = LIVE_MAX_BUFFER_SEGMENTS
         private const val REBUFFERS_PER_BUFFER_INCREASE = 1
         private const val STATIC_HEADER_PREFIX_BYTES = 1024
+        private const val TRACKS_EXPORT_FORMAT = "encodec-player-tracks-v1"
+        private const val STREAMS_EXPORT_FORMAT = "encodec-player-streams-v1"
         private const val STATIC_STARTUP_SECONDS = 1
         private const val STATIC_MIN_STARTUP_BYTES = 512
         private const val STATIC_MAX_STARTUP_BYTES = 8 * 1024
@@ -1462,17 +1642,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun decoderConfig(variant: EncodecVariant): DecoderConfig = when (variant) {
+    private fun decoderConfig(variant: EncodecVariant, codebooks: Int): DecoderConfig = when (variant) {
         EncodecVariant.STEREO_48_KHZ -> DecoderConfig(
             assetName = "encodec-decoder-48khz-f32.bin",
         )
-        EncodecVariant.MONO_24_KHZ -> DecoderConfig(
-            assetName = "encodec-decoder-24khz-f32.bin",
-        )
+        EncodecVariant.MONO_24_KHZ -> {
+            val vocos = mutableState.value.experimentalVocos && codebooks in setOf(2, 4, 8, 16)
+            DecoderConfig(
+                assetName = if (vocos) "vocos-encodec-24khz-f32.bin" else "encodec-decoder-24khz-f32.bin",
+                vocos = vocos,
+            )
+        }
     }
 
     private data class DecoderConfig(
         val assetName: String,
+        val vocos: Boolean = false,
     )
 
     /** Keep only one native model resident; variant changes trade a reload for much lower RAM use. */
@@ -1480,16 +1665,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         config: DecoderConfig,
         variant: EncodecVariant,
     ): EncodecDecoder {
-        cachedDecoder?.takeIf { it.variant == variant }?.let { return it }
+        cachedDecoder?.takeIf { it.variant == variant && (it is VocosDecoder) == config.vocos }?.let { return it }
         cachedDecoder?.close()
         cachedDecoder = null
-        return CppEncodecDecoder(
+        val decoder = if (config.vocos) VocosDecoder(
+            copyAssetOnce(config.assetName),
+            getApplication<Application>(),
+            diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
+        ) else CppEncodecDecoder(
             copyAssetOnce(config.assetName),
             variant,
-            rescale = true,
             context = getApplication<Application>(),
             diagnosticsEnabled = { mutableState.value.diagnosticsEnabled },
-        ).also { cachedDecoder = it }
+        )
+        return decoder.also { cachedDecoder = it }
     }
 
     private fun audioSink(variant: EncodecVariant): AudioTrackSink {
