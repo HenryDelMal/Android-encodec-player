@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.11.6
+
+- Add a saved Playback setting for decoder peak rescaling, disabled by default.
+- Apply the setting to both EnCodec and experimental Vocos decoding, including
+  live streams; changing it during playback restarts from the current position.
+
+## 0.11.5
+
+- Android Back now returns through player screens and settings before leaving the app.
+- Replace the bottom Add URL shortcut with a Streams library destination.
+- Add separate JSON import/export for saved tracks and livestreams.
+- Update playback progress on a one-second timer independent of decoder chunk timing.
+- Randomize live waveform bar heights and animate a single mirrored bar pair outward
+  from the center while a livestream is playing.
+- Use the waveform mark as the launcher app icon.
+
+## 0.11.4
+
+- Animate the track waveform with changing bar heights and playback-progress fill.
+- Add an infinitely repeating center-out antenna pulse for active livestreams;
+  it pauses when playback is paused.
+
+## 0.11.3
+
+- Redesigned the player with a station-focused home screen, separate Tracks and
+  Live browsing, a full-screen now-playing view, and category-based settings.
+- Added a soft violet light theme and selectable dark/system appearance.
+- Kept playback, seek, shuffle, repeat, saved stations, URL opening, and decoder
+  options available in the new layout.
+
+## 0.11.2
+
+- Make the Vocos setting apply its requested on/off state directly and clarify
+  when the current stream format supports Vocos.
+- Show which decoder is active in livestream status and use a globe icon for
+  opening remote URLs.
+
+## 0.11.1
+
+- Compact player controls and playlist layout; moved decoder and diagnostics
+  options into Settings.
+- Apply system-bar insets so the app content stays clear of the Android status
+  and navigation bars.
+
+## 0.11.0
+
+- Added a persistent experimental Vocos decoder button for existing 24 kHz mono
+  EnCodec files and livestreams at 1.5, 3, 6 and 12 kbps. No re-encoding is needed.
+- Bundled the official `charactr/vocos-encodec-24khz` checkpoint as native float32
+  weights. Inference uses C++/Eigen with one worker, bandwidth-conditioned
+  normalization and inverse-STFT synthesis; no Python or ML runtime is needed.
+- Retained peak rescaling. 48 kHz stereo and 24 kbps mono use the EnCodec decoder.
+- Added bounded future-token context to Vocos file decoding to avoid artifacts
+  at internal chunk boundaries, preserving exact output length and seeking.
+- Changing the decoder restarts finite playback at its current position or
+  reconnects the active livestream. EnCodec remains the default.
+- Added checkpoint export instructions and numerical parity checks against the
+  official Vocos implementation. Phone performance and battery use remain experimental.
+
 ## 0.10.7
 
 - Added Android Performance Hint integration for the existing single native
