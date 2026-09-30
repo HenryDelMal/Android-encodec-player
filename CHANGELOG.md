@@ -1,9 +1,14 @@
 # Changelog
 
+## 0.11.11
+
+- Selecting a track from the library replaces the current queue item instead of
+  silently adding another queued track. Use Add to Queue to add upcoming tracks.
+- Keep Home's Queue view at the top when the current track changes so the active
+  item remains visible.
+
 ## 0.11.10
 
-- Return Home's Queue view to the top when the current track changes, keeping the
-  newly playing item visible.
 - Fixed queue progression so Next follows the displayed order without returning
   to the previously playing track.
 - Keep a stable playlist order and current position; Home shows the current

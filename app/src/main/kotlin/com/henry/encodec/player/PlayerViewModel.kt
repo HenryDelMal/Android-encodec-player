@@ -565,8 +565,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         stopInternal(resetProgress = true)
-        val queue = snapshot.playlist + item
-        mutableState.value = snapshot.copy(playlist = queue, currentIndex = queue.lastIndex, live = null)
+        // Choosing a library track means “play this instead,” not “enqueue it.”
+        // Keep any explicitly queued following tracks in their existing order.
+        val replacement = replaceCurrentQueueItem(snapshot.playlist, snapshot.currentIndex, item)
+        mutableState.value = snapshot.copy(
+            playlist = replacement.items,
+            currentIndex = replacement.currentIndex,
+            live = null,
+        )
+        replacement.replacedItem?.let { previous ->
+            if (mutableState.value.libraryTracks.none { it.uri == previous.uri } &&
+                mutableState.value.playlist.none { it.uri == previous.uri }) {
+                releaseLocalPermission(previous)
+            }
+        }
         requestedStartSample = 0
         persistPlaylist()
         startPlayback()
