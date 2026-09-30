@@ -94,7 +94,9 @@ enum class RepeatMode {
 }
 
 data class PlayerState(
+    /** Playback queue. Kept separate from the user's saved track library. */
     val playlist: List<PlaylistItem> = emptyList(),
+    val libraryTracks: List<PlaylistItem> = emptyList(),
     val livestreams: List<SavedLiveStream> = emptyList(),
     val currentIndex: Int = -1,
     val playing: Boolean = false,
@@ -108,6 +110,7 @@ data class PlayerState(
     val diagnosticsEnabled: Boolean = false,
     val experimentalVocos: Boolean = false,
     val rescaleEnabled: Boolean = false,
+    val recentItems: List<String> = emptyList(),
 ) {
     val current: PlaylistItem? get() = playlist.getOrNull(currentIndex)
 }
@@ -176,7 +179,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun addToPlaylist(uris: List<Uri>) {
         val resolver = getApplication<Application>().contentResolver
-        val existing = mutableState.value.playlist.map { it.uri }.toSet()
+        val existing = mutableState.value.libraryTracks.map { it.uri }.toSet()
         val accepted = mutableListOf<PlaylistItem>()
         val errors = mutableListOf<String>()
 
@@ -198,10 +201,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
         val old = mutableState.value
         val combined = old.playlist + accepted
+        val knownLibrary = old.libraryTracks.mapTo(mutableSetOf()) { it.uri }
+        val library = old.libraryTracks + accepted.filter { knownLibrary.add(it.uri) }
         val selectingFirstTrack = old.currentIndex < 0 && combined.isNotEmpty()
         if (selectingFirstTrack) requestedStartSample = 0
         mutableState.value = old.copy(
             playlist = combined,
+            libraryTracks = library,
             currentIndex = if (selectingFirstTrack) 0 else old.currentIndex,
             progress = if (selectingFirstTrack) 0f else old.progress,
             error = errors.takeIf { it.isNotEmpty() }?.joinToString("\n"),
@@ -251,13 +257,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
             result.onSuccess { imported ->
                 val before = mutableState.value
-                val known = before.playlist.mapTo(mutableSetOf()) { it.uri.toString() }
+                val known = before.libraryTracks.mapTo(mutableSetOf()) { it.uri.toString() }
                 val additions = imported.filter { known.add(it.uri.toString()) }
                 val combined = before.playlist + additions
                 val first = before.currentIndex < 0 && combined.isNotEmpty()
                 if (first) requestedStartSample = 0
                 mutableState.value = before.copy(
                     playlist = combined,
+                    libraryTracks = before.libraryTracks + additions,
                     currentIndex = if (first) 0 else before.currentIndex,
                     progress = if (first) 0f else before.progress,
                     error = if (additions.isEmpty()) "No available tracks were imported" else "Imported ${additions.size} track(s)",
@@ -326,7 +333,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun exportTracks(destination: Uri) = exportLibrary(destination, TRACKS_EXPORT_FORMAT) { state ->
         JSONObject().put("format", TRACKS_EXPORT_FORMAT).put("version", 1).put("tracks", JSONArray().apply {
-            state.playlist.forEach { put(JSONObject().put("uri", it.uri.toString()).put("title", it.title)) }
+            state.libraryTracks.forEach { put(JSONObject().put("uri", it.uri.toString()).put("title", it.title)) }
         })
     }
 
@@ -370,8 +377,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             mutableState.value = mutableState.value.copy(error = "Enter a valid HTTPS URL")
             return
         }
-        if (mutableState.value.playlist.any { it.uri == uri }) {
-            mutableState.value = mutableState.value.copy(error = "That URL is already in the playlist")
+        if (mutableState.value.libraryTracks.any { it.uri == uri }) {
+            mutableState.value = mutableState.value.copy(error = "That URL is already in your tracks")
             return
         }
 
@@ -391,14 +398,16 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
             val old = mutableState.value
             result.onSuccess { item ->
-                if (old.playlist.any { it.uri == item.uri }) {
+                if (old.libraryTracks.any { it.uri == item.uri }) {
                     mutableState.value = old.copy(addingUrl = false)
                 } else {
                     val combined = old.playlist + item
+                    val library = old.libraryTracks + item
                     val selectingFirstTrack = old.currentIndex < 0
                     if (selectingFirstTrack) requestedStartSample = 0
                     mutableState.value = old.copy(
                         playlist = combined,
+                        libraryTracks = library,
                         currentIndex = if (selectingFirstTrack) 0 else old.currentIndex,
                         progress = if (selectingFirstTrack) 0f else old.progress,
                         addingUrl = false,
@@ -465,6 +474,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
         mutableState.value = snapshot.copy(
             livestreams = savedStreams,
+            recentItems = recentKey("stream", uri.toString(), snapshot.recentItems),
             live = LiveUiState(
                 manifestUrl = stream.manifestUrl,
                 title = stream.title,
@@ -486,13 +496,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         if (index !in snapshot.livestreams.indices) return
         mutableState.value = snapshot.copy(
             livestreams = snapshot.livestreams.toMutableList().apply { removeAt(index) },
+            recentItems = snapshot.recentItems.filterNot { it == "stream:${snapshot.livestreams[index].manifestUrl}" },
         )
+        persistPlaylist()
+    }
+
+    fun moveLiveStream(fromIndex: Int, toIndex: Int) {
+        val snapshot = mutableState.value
+        if (fromIndex !in snapshot.livestreams.indices || toIndex !in snapshot.livestreams.indices || fromIndex == toIndex) return
+        val reordered = snapshot.livestreams.toMutableList().apply {
+            add(toIndex, removeAt(fromIndex))
+        }
+        mutableState.value = snapshot.copy(livestreams = reordered)
         persistPlaylist()
     }
 
     fun clearLiveStreams() {
         if (mutableState.value.livestreams.isEmpty()) return
-        mutableState.value = mutableState.value.copy(livestreams = emptyList())
+        mutableState.value = mutableState.value.copy(
+            livestreams = emptyList(),
+            recentItems = mutableState.value.recentItems.filterNot { it.startsWith("stream:") },
+        )
         persistPlaylist()
     }
 
@@ -524,12 +548,68 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectTrack(index: Int) {
         if (index !in mutableState.value.playlist.indices) return
-        val wasActive = mutableState.value.playing
         requestedStartSample = 0
         stopInternal(resetProgress = true)
-        mutableState.value = mutableState.value.copy(currentIndex = index, live = null)
+        val snapshot = mutableState.value
+        mutableState.value = snapshot.copy(currentIndex = index, live = null)
         persistPlaylist()
-        if (wasActive) startPlayback()
+        startPlayback()
+    }
+
+    /** Play a library item, adding it to the queue if it is not there yet. */
+    fun playLibraryTrack(item: PlaylistItem) {
+        val snapshot = mutableState.value
+        val queueIndex = snapshot.playlist.indexOfFirst { it.uri == item.uri }
+        if (queueIndex >= 0) {
+            selectTrack(queueIndex)
+            return
+        }
+        stopInternal(resetProgress = true)
+        val queue = snapshot.playlist + item
+        mutableState.value = snapshot.copy(playlist = queue, currentIndex = queue.lastIndex, live = null)
+        requestedStartSample = 0
+        persistPlaylist()
+        startPlayback()
+    }
+
+    fun addLibraryTrackToQueue(item: PlaylistItem) {
+        val snapshot = mutableState.value
+        if (snapshot.playlist.any { it.uri == item.uri }) {
+            mutableState.value = snapshot.copy(error = "That track is already in the queue")
+            return
+        }
+        val queue = snapshot.playlist + item
+        val needsQueueSelection = snapshot.currentIndex < 0
+        val startNow = needsQueueSelection && snapshot.live == null
+        if (startNow) {
+            stopInternal(resetProgress = true)
+            requestedStartSample = 0
+        }
+        mutableState.value = snapshot.copy(
+            playlist = queue,
+            currentIndex = if (needsQueueSelection) 0 else snapshot.currentIndex,
+            progress = if (needsQueueSelection) 0f else snapshot.progress,
+            live = if (startNow) null else snapshot.live,
+        )
+        persistPlaylist()
+        if (startNow) startPlayback()
+    }
+
+    fun deleteLibraryTrack(item: PlaylistItem) {
+        val snapshot = mutableState.value
+        val library = snapshot.libraryTracks.filterNot { it.uri == item.uri }
+        val queueIndex = snapshot.playlist.indexOfFirst { it.uri == item.uri }
+        mutableState.value = snapshot.copy(libraryTracks = library)
+        if (queueIndex >= 0) removeTrack(queueIndex)
+        val updated = mutableState.value
+        mutableState.value = updated.copy(
+            libraryTracks = library,
+            recentItems = updated.recentItems.filterNot { it == "track:${item.uri}" },
+        )
+        if (library.none { it.uri == item.uri } && mutableState.value.playlist.none { it.uri == item.uri }) {
+            releaseLocalPermission(item)
+        }
+        persistPlaylist()
     }
 
     fun playPause() {
@@ -580,7 +660,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun next() {
         val snapshot = mutableState.value
-        if (snapshot.live != null) return
+        if (snapshot.live != null) {
+            stepSavedStream(1)
+            return
+        }
         if (snapshot.playlist.isEmpty()) return
         val nextIndex = when {
             snapshot.shuffle -> nextShuffleIndex(snapshot, restartCycle = true)
@@ -594,7 +677,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun previous() {
         val snapshot = mutableState.value
-        if (snapshot.live != null) return
+        if (snapshot.live != null) {
+            stepSavedStream(-1)
+            return
+        }
         if (snapshot.playlist.isEmpty()) return
         val positionSeconds = snapshot.current?.let {
             it.header.audioLengthSamples * snapshot.progress / it.header.variant.sampleRate
@@ -691,18 +777,19 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearPlaylist() {
         val snapshot = mutableState.value
-        snapshot.playlist.forEach(::releaseLocalPermission)
         shufflePlayedUris.clear()
-        requestedStartSample = 0
-        stopInternal(resetProgress = true)
-        stopPlaybackService()
-        mutableState.value = PlayerState(
-            livestreams = snapshot.livestreams,
-            shuffle = snapshot.shuffle,
-            repeatMode = snapshot.repeatMode,
-            diagnosticsEnabled = snapshot.diagnosticsEnabled,
-            experimentalVocos = snapshot.experimentalVocos,
-            rescaleEnabled = snapshot.rescaleEnabled,
+        if (snapshot.live == null) {
+            requestedStartSample = 0
+            stopInternal(resetProgress = true)
+            stopPlaybackService()
+        }
+        mutableState.value = snapshot.copy(
+            playlist = emptyList(),
+            currentIndex = -1,
+            playing = if (snapshot.live != null) snapshot.playing else false,
+            paused = if (snapshot.live != null) snapshot.paused else false,
+            progress = if (snapshot.live != null) snapshot.progress else 0f,
+            live = snapshot.live,
         )
         persistPlaylist()
     }
@@ -711,6 +798,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val snapshot = mutableState.value
         val removed = snapshot.playlist.getOrNull(index) ?: return
         shufflePlayedUris -= removed.uri.toString()
+        if (snapshot.live != null) {
+            val remaining = snapshot.playlist.toMutableList().apply { removeAt(index) }
+            val currentUri = snapshot.current?.uri
+            val currentIndex = remaining.indexOfFirst { it.uri == currentUri }.takeIf { it >= 0 }
+                ?: if (remaining.isEmpty()) -1 else index.coerceAtMost(remaining.lastIndex)
+            mutableState.value = snapshot.copy(playlist = remaining, currentIndex = currentIndex)
+            if (mutableState.value.libraryTracks.none { it.uri == removed.uri } &&
+                remaining.none { it.uri == removed.uri }) releaseLocalPermission(removed)
+            persistPlaylist()
+            return
+        }
         val wasPlaying = snapshot.playing
         val wasPaused = snapshot.paused
         val currentUri = snapshot.current?.uri
@@ -733,21 +831,66 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             playing = false,
             paused = false,
             progress = newProgress,
+            recentItems = snapshot.recentItems,
         )
-        releaseLocalPermission(removed)
         persistPlaylist()
         if (wasPlaying && newIndex >= 0) {
             startPlayback(startPaused = wasPaused)
         } else if (newIndex < 0) {
             stopPlaybackService()
         }
+        if (mutableState.value.libraryTracks.none { it.uri == removed.uri } &&
+            mutableState.value.playlist.none { it.uri == removed.uri }) releaseLocalPermission(removed)
     }
 
     private fun moveAndPlay(index: Int) {
         stopInternal(resetProgress = true)
-        mutableState.value = mutableState.value.copy(currentIndex = index, live = null)
+        val snapshot = mutableState.value
+        mutableState.value = snapshot.copy(currentIndex = index, live = null)
         persistPlaylist()
         startPlayback()
+    }
+
+    fun moveTrack(fromIndex: Int, toIndex: Int) {
+        val snapshot = mutableState.value
+        val queueStart = snapshot.currentIndex.coerceIn(0, snapshot.playlist.size)
+        val visibleQueue = snapshot.playlist.drop(queueStart)
+        if (fromIndex !in visibleQueue.indices || toIndex !in visibleQueue.indices || fromIndex == toIndex) return
+        if (fromIndex == 0 || toIndex == 0) return
+        val reordered = visibleQueue.toMutableList().apply {
+            add(toIndex, removeAt(fromIndex))
+        }
+        mutableState.value = snapshot.copy(
+            playlist = snapshot.playlist.take(queueStart) + reordered,
+            currentIndex = queueStart,
+        )
+        persistPlaylist()
+    }
+
+    fun removeRecent(key: String) {
+        val snapshot = mutableState.value
+        if (key !in snapshot.recentItems) return
+        mutableState.value = snapshot.copy(recentItems = snapshot.recentItems - key)
+        persistPlaylist()
+    }
+
+    private fun stepSavedStream(delta: Int) {
+        val snapshot = mutableState.value
+        if (snapshot.livestreams.size < 2) return
+        val currentUrl = snapshot.live?.manifestUrl ?: return
+        val currentIndex = snapshot.livestreams.indexOfFirst { it.manifestUrl == currentUrl }
+        if (currentIndex < 0) return
+        val nextIndex = Math.floorMod(currentIndex + delta, snapshot.livestreams.size)
+        openLive(snapshot.livestreams[nextIndex].manifestUrl)
+    }
+
+    private fun rememberRecentTrack(item: PlaylistItem) {
+        val snapshot = mutableState.value
+        val updated = recentKey("track", item.uri.toString(), snapshot.recentItems)
+        if (updated != snapshot.recentItems) {
+            mutableState.value = snapshot.copy(recentItems = updated)
+            persistPlaylist()
+        }
     }
 
     private fun startLivePlayback() {
@@ -1048,6 +1191,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         if (mutableState.value.live != null) {
             mutableState.value = mutableState.value.copy(live = null)
         }
+        rememberRecentTrack(selected)
         if (mutableState.value.shuffle) shufflePlayedUris += selected.uri.toString()
         if (requestedStartSample >= selected.header.audioLengthSamples - 1) {
             requestedStartSample = 0
@@ -1124,10 +1268,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                         if (playbackGeneration != generation) break
                         val nextIndex = nextIndexAfterCompletion(mutableState.value) ?: break
                         requestedStartSample = 0
-                        mutableState.value = mutableState.value.copy(
+                        val finishedState = mutableState.value
+                        mutableState.value = finishedState.copy(
                             currentIndex = nextIndex,
                             progress = 0f,
                         )
+                        mutableState.value.current?.let(::rememberRecentTrack)
                         persistPlaylist()
                     }
                 }
@@ -1184,8 +1330,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP
         val finiteActions = PlaybackState.ACTION_SKIP_TO_NEXT or
             PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO
+        val liveStationActions = if (state.livestreams.size > 1) {
+            PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+        } else {
+            0L
+        }
         val stateBuilder = PlaybackState.Builder()
-            .setActions(standardActions or if (live == null) finiteActions else 0L)
+            .setActions(standardActions or if (live == null) finiteActions else liveStationActions)
         if (live == null) {
             stateBuilder
                 .addCustomAction(
@@ -1298,7 +1449,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             .setOnlyAlertOnce(true)
             .setOngoing(!state.paused)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-        if (live != null) {
+        if (live != null && state.livestreams.size <= 1) {
             notificationBuilder.addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 "Stop",
@@ -1319,9 +1470,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             )
             .addAction(
                 android.R.drawable.ic_media_next,
-                if (live != null) "Jump to live" else "Next",
+                if (live != null && state.livestreams.size <= 1) "Jump to live" else "Next",
                 mediaIntent(
-                    if (live != null) MainActivity.ACTION_JUMP_LIVE else MainActivity.ACTION_NEXT,
+                    if (live != null && state.livestreams.size <= 1) MainActivity.ACTION_JUMP_LIVE else MainActivity.ACTION_NEXT,
                     3,
                 ),
             )
@@ -1474,6 +1625,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun persistPlaylist() = playlistStore.save(mutableState.value)
+
+    private fun recentKey(kind: String, value: String, existing: List<String>): List<String> =
+        (listOf("$kind:$value") + existing.filterNot { it == "$kind:$value" }).take(20)
 
     private fun releaseLocalPermission(item: PlaylistItem) {
         if (!item.uri.scheme.equals("content", ignoreCase = true)) return

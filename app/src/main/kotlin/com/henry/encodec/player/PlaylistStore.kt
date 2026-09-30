@@ -37,6 +37,26 @@ class PlaylistStore(context: Context) {
             }
         }
         val storedIndex = root.optInt("currentIndex", 0)
+        val currentIndex = if (items.isEmpty()) -1 else storedIndex.coerceIn(items.indices)
+        val libraryJson = root.optJSONArray("libraryTracks") ?: itemsJson
+        val libraryTracks = buildList {
+            for (index in 0 until libraryJson.length()) {
+                val item = runCatching { libraryJson.getJSONObject(index) }.getOrNull() ?: continue
+                runCatching {
+                    val variant = EncodecVariant.fromWireName(item.getString("variant"))
+                    val header = EcdcHeader(
+                        version = item.getInt("version"),
+                        variant = variant,
+                        audioLengthSamples = item.getLong("audioLengthSamples"),
+                        numCodebooks = item.getInt("numCodebooks"),
+                        usesLanguageModel = item.getBoolean("usesLanguageModel"),
+                    )
+                    if (!header.usesLanguageModel) PlaylistItem(
+                        Uri.parse(item.getString("uri")), item.getString("title"), header,
+                    ) else null
+                }.getOrNull()?.let(::add)
+            }
+        }.distinctBy { it.uri }
         val repeatMode = runCatching {
             RepeatMode.valueOf(root.optString("repeatMode", RepeatMode.OFF.name))
         }.getOrDefault(RepeatMode.OFF)
@@ -60,32 +80,45 @@ class PlaylistStore(context: Context) {
                 }
             }
         }
+        val recent = root.optJSONArray("recentItems")?.let { values ->
+            buildList {
+                for (index in 0 until values.length()) {
+                    val value = values.optString(index)
+                    if (value.startsWith("track:") || value.startsWith("stream:")) add(value)
+                }
+            }.distinct().take(20)
+        }.orEmpty()
         PlayerState(
             playlist = items,
+            libraryTracks = libraryTracks,
             livestreams = livestreams,
-            currentIndex = if (items.isEmpty()) -1 else storedIndex.coerceIn(items.indices),
+            currentIndex = currentIndex,
             shuffle = root.optBoolean("shuffle", false),
             repeatMode = repeatMode,
             diagnosticsEnabled = root.optBoolean("diagnosticsEnabled", false),
             experimentalVocos = root.optBoolean("experimentalVocos", false),
             rescaleEnabled = root.optBoolean("rescaleEnabled", false),
+            recentItems = recent,
         )
     }.getOrElse { PlayerState() }
 
     fun save(state: PlayerState) {
-        val items = JSONArray()
-        state.playlist.forEach { playlistItem ->
-            items.put(
-                JSONObject()
-                    .put("uri", playlistItem.uri.toString())
-                    .put("title", playlistItem.title)
-                    .put("version", playlistItem.header.version)
-                    .put("variant", playlistItem.header.variant.wireName)
-                    .put("audioLengthSamples", playlistItem.header.audioLengthSamples)
-                    .put("numCodebooks", playlistItem.header.numCodebooks)
-                    .put("usesLanguageModel", playlistItem.header.usesLanguageModel),
-            )
+        fun serializeTracks(tracks: List<PlaylistItem>): JSONArray = JSONArray().apply {
+            tracks.forEach { playlistItem ->
+                put(
+                    JSONObject()
+                        .put("uri", playlistItem.uri.toString())
+                        .put("title", playlistItem.title)
+                        .put("version", playlistItem.header.version)
+                        .put("variant", playlistItem.header.variant.wireName)
+                        .put("audioLengthSamples", playlistItem.header.audioLengthSamples)
+                        .put("numCodebooks", playlistItem.header.numCodebooks)
+                        .put("usesLanguageModel", playlistItem.header.usesLanguageModel),
+                )
+            }
         }
+        val items = serializeTracks(state.playlist)
+        val libraryTracks = serializeTracks(state.libraryTracks)
         val livestreams = JSONArray()
         state.livestreams.forEach { stream ->
             livestreams.put(
@@ -101,6 +134,8 @@ class PlaylistStore(context: Context) {
         }
         val root = JSONObject()
             .put("items", items)
+            .put("queueVersion", 2)
+            .put("libraryTracks", libraryTracks)
             .put("livestreams", livestreams)
             .put("currentIndex", state.currentIndex)
             .put("shuffle", state.shuffle)
@@ -108,6 +143,7 @@ class PlaylistStore(context: Context) {
             .put("diagnosticsEnabled", state.diagnosticsEnabled)
             .put("experimentalVocos", state.experimentalVocos)
             .put("rescaleEnabled", state.rescaleEnabled)
+            .put("recentItems", JSONArray().apply { state.recentItems.forEach { put(it) } })
         preferences.edit().putString(PLAYLIST_KEY, root.toString()).apply()
     }
 

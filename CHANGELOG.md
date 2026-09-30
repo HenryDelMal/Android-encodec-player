@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.11.10
+
+- Fixed queue progression so Next follows the displayed order without returning
+  to the previously playing track.
+- Keep a stable playlist order and current position; Home shows the current
+  track first followed by upcoming tracks, and drag reorders upcoming entries.
+
+## 0.11.9
+
+- Reworked queue and livestream reordering to lift the active row, have it
+  follow the finger continuously, and animate neighboring rows into place.
+
+## 0.11.8
+
+- Split the saved Tracks library from the playback queue while migrating
+  existing saved tracks automatically.
+- Added Home Queue and Recents tabs, a clear-queue action, and per-track menu
+  actions to add to queue or delete from the library.
+- Keep the playing track at the top of the queue; track selection promotes it
+  there, while manual ordering applies to upcoming tracks.
+- Improved drag feedback with lift, scale, and transparency while reordering.
+- Moved playback diagnostics under Advanced settings.
+- Replaced the Streams emoji with a matching outlined globe icon.
+- Changed the full-screen overflow button into a real menu; stopping playback
+  now requires choosing the clearly labeled Stop playback action.
+
+## 0.11.7
+
+- Return to Home after choosing a track or saved stream from its browse list.
+- Replace Home's saved-station cards with the current track queue and recent tracks
+  and stations; add tracks to the queue directly from Home.
+- Reorder queued tracks and saved livestream stations with a long press and drag.
+- Previous/next now switch between saved livestream stations while listening live.
+
 ## 0.11.6
 
 - Add a saved Playback setting for decoder peak rescaling, disabled by default.

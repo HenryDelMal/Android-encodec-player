@@ -17,6 +17,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,7 +34,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -67,12 +70,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,6 +89,9 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
+import androidx.compose.animation.core.animateFloatAsState
 import com.henry.encodec.ecdc.EcdcHeader
 import com.henry.encodec.ecdc.EncodecVariant
 import java.util.Locale
@@ -174,6 +184,7 @@ private fun PlayerScreen(
     var fullPlayer by rememberSaveable { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
     var moreMenu by remember { mutableStateOf(false) }
+    var homeTab by rememberSaveable { mutableStateOf("Queue") }
     val importTracksPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(model::importTracks)
     }
@@ -254,6 +265,8 @@ private fun PlayerScreen(
                     onShowLives = { browseLives = it },
                     search = search,
                     onSearch = { search = it },
+                    onTrackSelected = { page = "Home" },
+                    onStreamSelected = { page = "Home" },
                 )
                 "Settings" -> SettingsPage(
                     state = state,
@@ -275,7 +288,9 @@ private fun PlayerScreen(
                     onSeek = { model.seekToFraction(sliderPosition); draggingSlider = false },
                     onFullPlayer = { fullPlayer = true },
                     onBrowseLives = { browseLives = true; page = "Browse" },
-                    onOpenUrl = { showUrlDialog = true },
+                    onBrowseTracks = { browseLives = false; page = "Browse" },
+                    selectedTab = homeTab,
+                    onSelectedTab = { homeTab = it },
                 )
             }
         }
@@ -299,15 +314,11 @@ private fun PlayerScreen(
                             }
                         },
                         icon = {
-                            Text(
-                                when (destination) {
-                                    "Home" -> "⌂"
-                                    "Tracks" -> "♫"
-                                    "Streams" -> "🌐"
-                                    else -> "⚙"
-                                },
-                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 20.sp,
+                            val tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            if (destination == "Streams") GlobeGlyph(Modifier.size(21.dp), tint)
+                            else Text(
+                                when (destination) { "Home" -> "⌂"; "Tracks" -> "♫"; else -> "⚙" },
+                                color = tint, fontSize = 20.sp,
                             )
                         },
                         label = { Text(destination, style = MaterialTheme.typography.labelSmall) },
@@ -349,6 +360,20 @@ private fun PlayerScreen(
 }
 
 @Composable
+private fun GlobeGlyph(modifier: Modifier = Modifier, tint: Color = MaterialTheme.colorScheme.primary) {
+    Canvas(modifier) {
+        val stroke = size.minDimension * 0.075f
+        drawCircle(tint, style = Stroke(stroke))
+        drawOval(tint, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.31f, 0f),
+            size = androidx.compose.ui.geometry.Size(size.width * 0.38f, size.height), style = Stroke(stroke))
+        drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.06f, size.height * 0.36f),
+            androidx.compose.ui.geometry.Offset(size.width * 0.94f, size.height * 0.36f), stroke)
+        drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.06f, size.height * 0.64f),
+            androidx.compose.ui.geometry.Offset(size.width * 0.94f, size.height * 0.64f), stroke)
+    }
+}
+
+@Composable
 private fun HomePage(
     state: PlayerState,
     model: PlayerViewModel,
@@ -357,32 +382,108 @@ private fun HomePage(
     onSeek: () -> Unit,
     onFullPlayer: () -> Unit,
     onBrowseLives: () -> Unit,
-    onOpenUrl: () -> Unit,
+    onBrowseTracks: () -> Unit,
+    selectedTab: String,
+    onSelectedTab: (String) -> Unit,
 ) {
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+    val queueRows = remember(state.playlist, state.currentIndex) {
+        if (state.playlist.isEmpty()) emptyList()
+        else {
+            val start = state.currentIndex.coerceIn(0, state.playlist.size)
+            state.playlist.drop(start).mapIndexed { offset, item ->
+                (start + offset) to item
+            }
+        }
+    }
+    val recentRows = remember(state.recentItems, state.libraryTracks, state.livestreams) {
+        state.recentItems.take(8).mapNotNull { key ->
+            when {
+                key.startsWith("track:") -> state.libraryTracks.firstOrNull { it.uri.toString() == key.removePrefix("track:") }
+                    ?.let { item -> key to (item.title to "Track · ${formatBitrate(item.header)} · ${formatAudioFormat(item.header)}") }
+                key.startsWith("stream:") -> state.livestreams.firstOrNull { it.manifestUrl == key.removePrefix("stream:") }
+                    ?.let { item -> key to (item.title to "Stream · ${item.manifestUrl}") }
+                else -> null
+            }
+        }
+    }
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        PlayerHeroCard(state, model, sliderPosition, onSlider, onSeek, onFullPlayer)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Saved livestreams", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-            TextButton(onClick = onBrowseLives) { Text("See all") }
+        item(key = "home-player") { PlayerHeroCard(state, model, sliderPosition, onSlider, onSeek, onFullPlayer) }
+        item(key = "home-tabs") {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(selected = selectedTab == "Queue", onClick = { onSelectedTab("Queue") },
+                    label = { Text("Queue · ${queueRows.size}") })
+                FilterChip(selected = selectedTab == "Recents", onClick = { onSelectedTab("Recents") },
+                    label = { Text("Recents") })
+                Spacer(Modifier.weight(1f))
+                if (selectedTab == "Queue") {
+                    IconButton(enabled = state.playlist.isNotEmpty(), onClick = model::clearPlaylist) {
+                        Icon(painterResource(android.R.drawable.ic_menu_delete), contentDescription = "Clear queue")
+                    }
+                    IconButton(onClick = onBrowseTracks) {
+                        Icon(painterResource(android.R.drawable.ic_menu_add), contentDescription = "Add from tracks")
+                    }
+                } else IconButton(onClick = onBrowseLives) { GlobeGlyph(Modifier.size(21.dp)) }
+            }
         }
-        if (state.livestreams.isEmpty()) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                shape = RoundedCornerShape(22.dp)) {
-                Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Your stations will appear here", style = MaterialTheme.typography.titleSmall)
-                    Text("Add an EnCodec Live stream with its manifest URL.", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    FilledTonalButton(onClick = onOpenUrl) { Text("＋  Add URL") }
+        if (selectedTab == "Queue") {
+            item(key = "queue-hint") {
+                Text("Hold and drag a queued track to change playback order", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (queueRows.isEmpty()) {
+                item(key = "queue-empty") {
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        shape = RoundedCornerShape(22.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Your playback queue is empty", style = MaterialTheme.typography.titleSmall)
+                            Text("Add tracks from your library. Streams stay in their own list.", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            FilledTonalButton(onClick = onBrowseTracks) { Text("Browse tracks") }
+                        }
+                    }
+                }
+            } else {
+                itemsIndexed(queueRows, key = { _, row -> "queue:${row.second.uri}" }) { index, row ->
+                    val (actualIndex, item) = row
+                    TrackRow(
+                        index = index,
+                        item = item,
+                        selected = state.live == null && index == 0,
+                        onClick = { model.selectTrack(actualIndex) },
+                        onRemove = { model.removeTrack(actualIndex) },
+                        onMove = if (index == 0) null else model::moveTrack,
+                        maxIndex = queueRows.lastIndex,
+                        minIndex = 1,
+                        placementModifier = Modifier.animateItem(),
+                    )
                 }
             }
         } else {
-            state.livestreams.take(4).forEachIndexed { index, stream ->
-                StreamRow(stream, state.live?.manifestUrl == stream.manifestUrl,
-                    onClick = { model.openLive(stream.manifestUrl) },
-                    onRemove = { model.removeLiveStream(index) })
+            item(key = "recents-hint") {
+                Text("Tracks and stations · most recent first", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (recentRows.isEmpty()) {
+                item(key = "recents-empty") {
+                    Text("Your recent tracks and stations will show here.", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else items(recentRows, key = { it.first }) { (key, details) ->
+                RecentRow(
+                    title = details.first,
+                    subtitle = details.second,
+                    isStream = key.startsWith("stream:"),
+                    onClick = {
+                        if (key.startsWith("stream:")) model.openLive(key.removePrefix("stream:"))
+                        else state.libraryTracks.firstOrNull { it.uri.toString() == key.removePrefix("track:") }
+                            ?.let(model::playLibraryTrack)
+                    },
+                    onRemove = { model.removeRecent(key) },
+                )
             }
         }
     }
@@ -462,16 +563,18 @@ private fun BrowsePage(
     onShowLives: (Boolean) -> Unit,
     search: String,
     onSearch: (String) -> Unit,
+    onTrackSelected: () -> Unit,
+    onStreamSelected: () -> Unit,
 ) {
     Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text("Browse", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            IconButton(onClick = if (showLives) model::clearLiveStreams else model::clearPlaylist) {
-                Icon(painterResource(android.R.drawable.ic_menu_delete), contentDescription = "Clear list")
+            if (showLives) IconButton(onClick = model::clearLiveStreams) {
+                Icon(painterResource(android.R.drawable.ic_menu_delete), contentDescription = "Clear saved streams")
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = !showLives, onClick = { onShowLives(false) }, label = { Text("Tracks (${state.playlist.size})") })
+            FilterChip(selected = !showLives, onClick = { onShowLives(false) }, label = { Text("Tracks (${state.libraryTracks.size})") })
             FilterChip(selected = showLives, onClick = { onShowLives(true) }, label = { Text("Live (${state.livestreams.size})") })
         }
         OutlinedTextField(
@@ -484,21 +587,32 @@ private fun BrowsePage(
             shape = RoundedCornerShape(16.dp),
         )
         if (showLives) {
+            Text("Hold and drag a station to change order", Modifier.padding(bottom = 4.dp),
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             val streams = state.livestreams.withIndex().filter { it.value.title.contains(search, true) || it.value.manifestUrl.contains(search, true) }
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                 itemsIndexed(streams, key = { _, entry -> entry.value.manifestUrl }) { _, entry ->
                     StreamRow(entry.value, state.live?.manifestUrl == entry.value.manifestUrl,
-                        onClick = { model.openLive(entry.value.manifestUrl) },
-                        onRemove = { model.removeLiveStream(entry.index) })
+                        onClick = { model.openLive(entry.value.manifestUrl); onStreamSelected() },
+                        onRemove = { model.removeLiveStream(entry.index) },
+                        onMove = model::moveLiveStream,
+                        index = entry.index,
+                        maxIndex = state.livestreams.lastIndex,
+                        placementModifier = Modifier.animateItem())
                 }
             }
         } else {
-            val tracks = state.playlist.withIndex().filter { it.value.title.contains(search, true) || it.value.uri.toString().contains(search, true) }
+            val tracks = state.libraryTracks.filter { it.title.contains(search, true) || it.uri.toString().contains(search, true) }
             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                itemsIndexed(tracks, key = { _, entry -> entry.value.uri.toString() }) { _, entry ->
-                    TrackRow(entry.index, entry.value, state.live == null && entry.index == state.currentIndex,
-                        onClick = { model.selectTrack(entry.index) },
-                        onRemove = { model.removeTrack(entry.index) })
+                itemsIndexed(tracks, key = { _, entry -> entry.uri.toString() }) { _, entry ->
+                    LibraryTrackRow(
+                        item = entry,
+                        selected = state.live == null && state.current?.uri == entry.uri,
+                        inQueue = state.playlist.any { it.uri == entry.uri },
+                        onClick = { model.playLibraryTrack(entry); onTrackSelected() },
+                        onAddToQueue = { model.addLibraryTrackToQueue(entry) },
+                        onDelete = { model.deleteLibraryTrack(entry) },
+                    )
                 }
             }
         }
@@ -583,7 +697,6 @@ private fun SettingsPage(
                     checked = state.experimentalVocos,
                     onChecked = model::setExperimentalVocos,
                 )
-                SettingsToggle("Playback diagnostics", "Extra decoder and stream logs", state.diagnosticsEnabled) { model.toggleDiagnostics() }
                 SettingsToggle(
                     title = "Rescale decoded audio",
                     subtitle = if (state.rescaleEnabled) {
@@ -596,6 +709,7 @@ private fun SettingsPage(
                 )
             }
             "Network" -> SettingsInfo("Live streams refresh their manifest as needed and buffer ahead based on connection performance.")
+            "Advanced" -> SettingsToggle("Playback diagnostics", "Extra decoder and stream logs", state.diagnosticsEnabled) { model.toggleDiagnostics() }
             "Library" -> {
                 Text("Tracks · ${state.playlist.size}", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                 Text("Import or export your saved ECDC file list.", style = MaterialTheme.typography.bodySmall,
@@ -614,7 +728,7 @@ private fun SettingsPage(
                 Text("File entries refer to their original location; copied local files need to remain accessible.",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            else -> SettingsInfo("EnCodec Player · version 0.11.6\nHQ EnCodec playback with experimental Vocos support for compatible 24 kHz mono audio.")
+            else -> SettingsInfo("EnCodec Player · version 0.11.8\nHQ EnCodec playback with experimental Vocos support for compatible 24 kHz mono audio.")
         }
     }
 }
@@ -628,6 +742,7 @@ private fun FullPlayerPage(
     onSeek: () -> Unit,
     onClose: () -> Unit,
 ) {
+    var overflowOpen by remember { mutableStateOf(false) }
     val live = state.live
     val item = state.current
     Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF151322), Color(0xFF090912))))
@@ -638,7 +753,15 @@ private fun FullPlayerPage(
             Spacer(Modifier.weight(1f))
             Text(if (live != null) "◉ LIVE" else "NOW PLAYING", color = Color(0xFFB7A6FF), style = MaterialTheme.typography.labelLarge)
             Spacer(Modifier.weight(1f))
-            IconButton(onClick = model::stop) { Text("⋮", color = Color.White, fontSize = 24.sp) }
+            Box {
+                IconButton(onClick = { overflowOpen = true }) { Text("⋮", color = Color.White, fontSize = 24.sp) }
+                DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
+                    DropdownMenuItem(text = { Text("Stop playback") }, onClick = {
+                        overflowOpen = false
+                        model.stop()
+                    })
+                }
+            }
         }
         StationArtwork(Modifier.size(250.dp), label = live?.title ?: item?.title ?: "EnCodec", large = true)
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -701,10 +824,11 @@ private fun PlaybackTimeline(
 @Composable
 private fun TransportControls(state: PlayerState, model: PlayerViewModel, compact: Boolean, dark: Boolean = false) {
     val muted = if (dark) Color.White else MaterialTheme.colorScheme.onSurface
+    val canChangeLiveStation = state.live != null && state.livestreams.size > 1
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
         PlayerAction("⤨", "Shuffle", state.shuffle, compact, dark, enabled = state.live == null && state.playlist.isNotEmpty(), onClick = model::toggleShuffle)
         PlayerAction("|◀", "Previous", false, compact, dark,
-            enabled = state.live == null && (state.currentIndex > 0 || state.repeatMode == RepeatMode.LIST), onClick = model::previous)
+            enabled = canChangeLiveStation || (state.live == null && (state.currentIndex > 0 || state.repeatMode == RepeatMode.LIST)), onClick = model::previous)
         Surface(
             modifier = Modifier.size(if (compact) 54.dp else 68.dp).clickable(enabled = state.current != null || state.live != null, onClick = model::playPause),
             shape = androidx.compose.foundation.shape.CircleShape,
@@ -717,7 +841,7 @@ private fun TransportControls(state: PlayerState, model: PlayerViewModel, compac
             }
         }
         PlayerAction("▶|", "Next", false, compact, dark,
-            enabled = state.live == null && state.playlist.size > 1 && (state.shuffle || state.currentIndex < state.playlist.lastIndex || state.repeatMode == RepeatMode.LIST), onClick = model::next)
+            enabled = canChangeLiveStation || (state.live == null && state.playlist.size > 1 && (state.shuffle || state.currentIndex < state.playlist.lastIndex || state.repeatMode == RepeatMode.LIST)), onClick = model::next)
         PlayerAction(if (state.repeatMode == RepeatMode.TRACK) "1↻" else "↻", "Repeat", state.repeatMode != RepeatMode.OFF, compact, dark,
             enabled = state.live == null && state.playlist.isNotEmpty(), onClick = model::cycleRepeatMode)
     }
@@ -749,8 +873,18 @@ private fun LiveActions(model: PlayerViewModel) {
 }
 
 @Composable
-private fun StreamRow(item: SavedLiveStream, selected: Boolean, onClick: () -> Unit, onRemove: () -> Unit) {
-    Card(Modifier.fillMaxWidth().clickable(onClick = onClick),
+private fun StreamRow(
+    item: SavedLiveStream,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onRemove: () -> Unit,
+    index: Int = 0,
+    maxIndex: Int = 0,
+    onMove: ((Int, Int) -> Unit)? = null,
+    placementModifier: Modifier = Modifier,
+) {
+    val dragModifier = onMove?.let { rememberReorderModifier(index, maxIndex, it) } ?: Modifier
+    Card(placementModifier.fillMaxWidth().then(dragModifier).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp), elevation = CardDefaults.cardElevation(1.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -774,8 +908,19 @@ private fun StreamRow(item: SavedLiveStream, selected: Boolean, onClick: () -> U
 }
 
 @Composable
-private fun TrackRow(index: Int, item: PlaylistItem, selected: Boolean, onClick: () -> Unit, onRemove: () -> Unit) {
-    Card(Modifier.fillMaxWidth().clickable(onClick = onClick),
+private fun TrackRow(
+    index: Int,
+    item: PlaylistItem,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onRemove: () -> Unit,
+    maxIndex: Int = index,
+    onMove: ((Int, Int) -> Unit)? = null,
+    minIndex: Int = 0,
+    placementModifier: Modifier = Modifier,
+) {
+    val dragModifier = onMove?.let { rememberReorderModifier(index, maxIndex, it, minIndex) } ?: Modifier
+    Card(placementModifier.fillMaxWidth().then(dragModifier).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp), elevation = CardDefaults.cardElevation(1.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -791,6 +936,128 @@ private fun TrackRow(index: Int, item: PlaylistItem, selected: Boolean, onClick:
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             IconButton(onClick = onRemove) { Icon(painterResource(android.R.drawable.ic_menu_delete), contentDescription = "Remove ${item.title}") }
         }
+    }
+}
+
+@Composable
+private fun LibraryTrackRow(
+    item: PlaylistItem,
+    selected: Boolean,
+    inQueue: Boolean,
+    onClick: () -> Unit,
+    onAddToQueue: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(18.dp), elevation = CardDefaults.cardElevation(1.dp)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(if (selected) "▶" else "♫", color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.width(26.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(item.title, style = MaterialTheme.typography.titleSmall, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("${item.uri.scheme.orEmpty().uppercase(Locale.US)} · ${formatBitrate(item.header)} · ${item.header.numCodebooks} codebooks · ${formatAudioFormat(item.header)}",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (inQueue) SmallBadge("Queued")
+            Box {
+                IconButton(onClick = { menuOpen = true }) { Text("⋮", fontSize = 21.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(text = { Text(if (inQueue) "Already in queue" else "Add to Queue") }, enabled = !inQueue,
+                        onClick = { menuOpen = false; onAddToQueue() })
+                    DropdownMenuItem(text = { Text("Delete from Tracks") }, onClick = { menuOpen = false; onDelete() })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentRow(
+    title: String,
+    subtitle: String,
+    isStream: Boolean,
+    onClick: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(if (isStream) "◉" else "♫", color = MaterialTheme.colorScheme.primary, fontSize = 20.sp)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            IconButton(onClick = onRemove) {
+                Icon(painterResource(android.R.drawable.ic_menu_close_clear_cancel), contentDescription = "Remove from recents")
+            }
+        }
+    }
+}
+
+@Composable
+private fun rememberReorderModifier(
+    index: Int,
+    maxIndex: Int,
+    onMove: (Int, Int) -> Unit,
+    minIndex: Int = 0,
+): Modifier {
+    val currentIndex = rememberUpdatedState(index)
+    val currentMaxIndex = rememberUpdatedState(maxIndex)
+    val currentOnMove = rememberUpdatedState(onMove)
+    val density = LocalDensity.current
+    var dragging by remember { mutableStateOf(false) }
+    var dragOffsetY by remember { mutableFloatStateOf(0f) }
+    val scale by animateFloatAsState(if (dragging) 1.035f else 1f, label = "drag-scale")
+    val liftTarget = with(density) { if (dragging) 12.dp.toPx() else 1.dp.toPx() }
+    val lift by animateFloatAsState(liftTarget, label = "drag-lift")
+    return Modifier.graphicsLayer {
+        scaleX = scale
+        scaleY = scale
+        shadowElevation = lift
+        translationY = dragOffsetY
+        alpha = if (dragging) 0.98f else 1f
+    }.zIndex(if (dragging) 1f else 0f).pointerInput(Unit) {
+        val spacing = with(density) { 7.dp.toPx() }
+        val threshold = size.height + spacing
+        var accumulated = 0f
+        var movingIndex = currentIndex.value
+        detectDragGesturesAfterLongPress(
+            onDragStart = {
+                accumulated = 0f
+                movingIndex = currentIndex.value
+                dragOffsetY = 0f
+                dragging = true
+            },
+            onDragEnd = { accumulated = 0f; dragOffsetY = 0f; dragging = false },
+            onDragCancel = { accumulated = 0f; dragOffsetY = 0f; dragging = false },
+            onDrag = { change, dragAmount ->
+                change.consume()
+                accumulated += dragAmount.y
+                dragOffsetY += dragAmount.y
+                while (accumulated >= threshold && movingIndex < currentMaxIndex.value) {
+                    val from = movingIndex
+                    currentOnMove.value(from, from + 1)
+                    movingIndex++
+                    accumulated -= threshold
+                    dragOffsetY -= threshold
+                }
+                while (accumulated <= -threshold && movingIndex > minIndex) {
+                    val from = movingIndex
+                    currentOnMove.value(from, from - 1)
+                    movingIndex--
+                    accumulated += threshold
+                    dragOffsetY += threshold
+                }
+            },
+        )
     }
 }
 
