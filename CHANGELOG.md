@@ -2,6 +2,8 @@
 
 ## 0.11.10
 
+- Return Home's Queue view to the top when the current track changes, keeping the
+  newly playing item visible.
 - Fixed queue progression so Next follows the displayed order without returning
   to the previously playing track.
 - Keep a stable playlist order and current position; Home shows the current

@@ -36,6 +36,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -406,8 +407,16 @@ private fun HomePage(
             }
         }
     }
+    val listState = rememberLazyListState()
+    // The queue is projected from the current track onward. If playback changes
+    // while Home is scrolled down, reset the list so the new current item isn't
+    // left outside the visible portion of that projection.
+    LaunchedEffect(state.currentIndex, state.playlist.size, selectedTab) {
+        if (selectedTab == "Queue") listState.animateScrollToItem(0)
+    }
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp),
+        state = listState,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item(key = "home-player") { PlayerHeroCard(state, model, sliderPosition, onSlider, onSeek, onFullPlayer) }
